@@ -1,14 +1,42 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ===== Hilfsfunktionen =====
-msg() { echo -e "$*"; }
-ask() { read -r -p "$1 [y/N]: " ans; [[ "${ans:-}" =~ ^[Yy]$ ]]; }
-die() { echo "❌ $*" >&2; exit 1; }
-need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Benötigtes Kommando fehlt: $1"; }
+# =====================[ Language Selection / Sprachwahl ]=====================
+# Optional: preset via environment, e.g. LANG_CHOICE=en
+LANG_CHOICE="${LANG_CHOICE:-}"
+
+if [[ -z "$LANG_CHOICE" && -t 0 && -t 1 ]]; then
+  echo "Bitte Sprache wählen / Please select language:"
+  echo "1) Deutsch"
+  echo "2) English"
+  read -rp "Auswahl / Choice (1/2): " _ch
+  case "${_ch:-}" in
+    1) LANG_CHOICE="de" ;;
+    2) LANG_CHOICE="en" ;;
+    *) LANG_CHOICE="en" ;;  # Default English
+  esac
+elif [[ -z "$LANG_CHOICE" ]]; then
+  LANG_CHOICE="en"
+fi
+
+# Simple i18n helpers
+M() { # print message in chosen language: M "DE" "EN"
+  if [[ "$LANG_CHOICE" == "de" ]]; then echo -e "$1"; else echo -e "$2"; fi
+}
+ASK() { # ask yes/no; returns 0 if yes: ASK "DE question" "EN question"
+  local qd="$1" qe="$2" ans
+  if [[ "$LANG_CHOICE" == "de" ]]; then
+    read -r -p "$qd [j/N]: " ans; [[ "${ans:-}" =~ ^([JjYy])$ ]]
+  else
+    read -r -p "$qe [y/N]: " ans; [[ "${ans:-}" =~ ^([YyJj])$ ]]
+  fi
+}
+die() { M "❌ $1" "❌ $2" >&2; exit 1; }          # die "DE" "EN"
+msg() { M "$1" "$2"; }                            # msg "DE" "EN"
+need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Benötigtes Kommando fehlt: $1" "Required command missing: $1"; }
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-# systemd-inhibit Wrapper (verhindert Sleep/Idle/Lid während kritischer Jobs)
+# =====================[ Power inhibit / Schlaf verhindern ]==================
 run_inhibited() {
   local why="${1:?}"; shift
   if has_cmd systemd-inhibit; then
@@ -18,15 +46,12 @@ run_inhibited() {
   fi
 }
 
-# ===== Systemdisk-Erkennung (robust: raw parents, LVM/mapper-fähig) =====
+# =====================[ Systemdisk-Erkennung (LVM/mapper) ]==================
 detect_system_disk() {
   need_cmd lsblk; need_cmd awk
-
-  # 1) Root-Gerät
   local root_dev
   root_dev="$(lsblk -rpn -o NAME,MOUNTPOINT | awk '$2=="/"{print $1; exit}')"
 
-  # 2) Fallback: findmnt-Quelle auf /dev/* mappen
   if [[ -z "$root_dev" || ! -e "$root_dev" ]]; then
     local src; src="$(findmnt -no SOURCE / || true)"
     if [[ -n "$src" ]]; then
@@ -42,22 +67,15 @@ detect_system_disk() {
     fi
   fi
 
-  # 3) Fallback: Partition mit "/"
   if [[ -z "$root_dev" || ! -e "$root_dev" ]]; then
     root_dev="$(lsblk -rpn -o NAME,TYPE,MOUNTPOINT | awk '$2=="part" && $3=="/"{print $1; exit}')"
   fi
+  [[ -n "$root_dev" && -e "$root_dev" ]] || { msg "[detect] Root-Gerät unbekannt" "[detect] Root device unknown"; return 1; }
 
-  [[ -n "$root_dev" && -e "$root_dev" ]] || { msg "[detect] Root-Gerät unbekannt"; return 1; }
-
-  # 4) Eltern-Kette → Top-Level-Disk
   local topdisk
-  topdisk="$(lsblk -rpnso NAME,TYPE -s "$root_dev" 2>/dev/null \
-            | awk '$2=="disk"{last=$1} END{if(last) print last}')"
-  if [[ -n "$topdisk" && -b "$topdisk" ]]; then
-    echo "$topdisk"; return 0
-  fi
+  topdisk="$(lsblk -rpnso NAME,TYPE -s "$root_dev" 2>/dev/null | awk '$2=="disk"{last=$1} END{if(last) print last}')"
+  if [[ -n "$topdisk" && -b "$topdisk" ]]; then echo "$topdisk"; return 0; fi
 
-  # 5) Fallback via PKNAME
   local cur="$root_dev"
   for _ in {1..12}; do
     local typ pk
@@ -70,7 +88,7 @@ detect_system_disk() {
   return 1
 }
 
-# ===== Geräte/Disks anzeigen & auswählen =====
+# =====================[ Disks anzeigen/auswählen ]===========================
 list_available_disks() {
   need_cmd lsblk
   lsblk -dnpo NAME,SIZE,MODEL,TYPE | while IFS= read -r line; do
@@ -88,47 +106,53 @@ list_available_disks() {
 select_target_disk() {
   local current_disk="${1:-}"
   local disks=()
-  echo "[*] Verfügbare Disks:" >&2
+  msg "[*] Verfügbare Disks:" "[*] Available disks:"
   local i=1
   while IFS='|' read -r name size model; do
     if [[ "$name" == "$current_disk" ]]; then
-      echo "  $i) $name ($size) - $model [AKTUELL SYSTEM-DISK]" >&2
+      M "  $i) $name ($size) - $model [AKTUELL SYSTEM-DISK]" \
+        "  $i) $name ($size) - $model [CURRENT SYSTEM DISK]"
     else
-      echo "  $i) $name ($size) - $model" >&2
+      echo "  $i) $name ($size) - $model"
     fi
     disks+=("$name"); ((i++))
   done < <(list_available_disks)
-  (( ${#disks[@]} > 0 )) || die "Keine geeigneten Disks gefunden"
+  (( ${#disks[@]} > 0 )) || die "Keine geeigneten Disks gefunden" "No suitable disks found"
+
   if (( ${#disks[@]} == 1 )); then
-    echo "[*] Nur eine Disk verfügbar: ${disks[0]}" >&2
+    M "[*] Nur eine Disk verfügbar: ${disks[0]}" "[*] Only one disk available: ${disks[0]}"
     echo "${disks[0]}"; return 0
   fi
-  echo >&2
-  read -rp "Ziel-Disk auswählen (1-${#disks[@]}): " choice >&2
-  [[ "$choice" =~ ^[0-9]+$ ]] && (( choice>=1 && choice<=${#disks[@]} )) || die "Ungültige Auswahl: $choice"
+
+  echo
+  if [[ "$LANG_CHOICE" == "de" ]]; then
+    read -rp "Ziel-Disk auswählen (1-${#disks[@]}): " choice
+  else
+    read -rp "Select target disk (1-${#disks[@]}): " choice
+  fi
+  [[ "$choice" =~ ^[0-9]+$ ]] && (( choice>=1 && choice<=${#disks[@]} )) || die "Ungültige Auswahl: $choice" "Invalid selection: $choice"
+
   local selected="${disks[$((choice-1))]}"
   if [[ "$selected" == "$current_disk" ]]; then
-    echo "⚠️  Du hast die aktuelle System-Disk ausgewählt!" >&2
-    ask "Bist du sicher, dass du das System überschreiben willst?" || die "Abgebrochen"
+    M "⚠️  Du hast die aktuelle System-Disk ausgewählt!" "⚠️  You selected the current system disk!"
+    ASK "Bist du sicher, dass du das System überschreiben willst?" "Are you sure you want to overwrite the system?" || die "Abgebrochen" "Aborted"
   fi
   echo "$selected"
 }
 
-# === Backup-Ziel finden/mounten (case-insensitive Teilstring, per Device mounten) ===
+# ============[ Backup-Ziel finden/mounten (Label-Teilstring, CI) ]===========
 SELECT_BACKUP=""
 detect_backup_dir() {
   local label="${1:?}"
   need_cmd lsblk
   local query="${label^^}"
 
-  # Kandidaten: NAME, LABEL, MOUNTPOINT, FSTYPE (nur Labels, die den String enthalten)
   mapfile -t CANDS < <(
     lsblk -rpn -o NAME,LABEL,MOUNTPOINT,FSTYPE \
     | awk -v Q="$query" 'toupper($2) ~ Q {printf "%s\t%s\t%s\t%s\n",$1,$2,$3,$4}'
   )
   (( ${#CANDS[@]} )) || return 1
 
-  # 1) bereits gemountet & schreibbar?
   local line dev lab mp fs
   for line in "${CANDS[@]}"; do
     IFS=$'\t' read -r dev lab mp fs <<<"$line"
@@ -137,32 +161,31 @@ detect_backup_dir() {
     fi
   done
 
-  # 2) Bei mehreren: Auswahl (wenn interaktiv oder SELECT_BACKUP)
   local pick=1
   if (( ${#CANDS[@]} > 1 )) && [[ -t 0 && -t 1 || -n "${SELECT_BACKUP:-}" ]]; then
-    echo "[*] Mehrere mögliche Backup-Ziele gefunden (Label enthält: \"$label\"):" >&2
+    M "[*] Mehrere mögliche Backup-Ziele gefunden (Label enthält: \"$label\"):" \
+      "[*] Multiple candidate backup targets found (label contains: \"$label\"):"
     local i=1
     for line in "${CANDS[@]}"; do
       IFS=$'\t' read -r dev lab mp fs <<<"$line"
-      printf "  %d) %s  [LABEL=%s FSTYPE=%s]\n" "$i" "$dev" "${lab:-<none>}" "${fs:-?}" >&2
+      printf "  %d) %s  [LABEL=%s FSTYPE=%s]\n" "$i" "$dev" "${lab:-<none>}" "${fs:-?}"
       ((i++))
     done
-    read -rp "Backup-Ziel wählen (1-$((i-1))): " pick >&2
-    [[ "$pick" =~ ^[0-9]+$ ]] && (( pick>=1 && pick<i )) || die "Ungültige Auswahl"
+    if [[ "$LANG_CHOICE" == "de" ]]; then
+      read -rp "Backup-Ziel wählen (1-$((i-1))): " pick
+    else
+      read -rp "Select backup target (1-$((i-1))): " pick
+    fi
+    [[ "$pick" =~ ^[0-9]+$ ]] && (( pick>=1 && pick<i )) || die "Ungültige Auswahl" "Invalid selection"
   fi
 
-  # 3) Ausgewählten Kandidaten mounten (per Device, nicht per Label)
   IFS=$'\t' read -r dev lab mp fs <<<"${CANDS[$((pick-1))]}"
   local safe_lab="${lab//[^[:alnum:]\-_]/_}"; [[ -n "$safe_lab" ]] || safe_lab="panzerbackup"
   local target="/mnt/$safe_lab"
   mkdir -p "$target"
 
-  if mount "$dev" "$target" 2>/dev/null; then
-    echo "$target"; return 0
-  fi
-  if [[ -n "$fs" ]] && mount -t "$fs" "$dev" "$target" 2>/dev/null; then
-    echo "$target"; return 0
-  fi
+  if mount "$dev" "$target" 2>/dev/null; then echo "$target"; return 0; fi
+  if [[ -n "$fs" ]] && mount -t "$fs" "$dev" "$target" 2>/dev/null; then echo "$target"; return 0; fi
   return 1
 }
 
@@ -173,7 +196,7 @@ rotate_old() {
     "$dir"/panzer_*.img.gpg "$dir"/panzer_*.img.zst.gpg 2>/dev/null || true)
   if (( ${#ALL[@]} > keep )); then
     for old in "${ALL[@]:$keep}"; do
-      msg "  - Entferne alt: $old"
+      M "  - Entferne alt: $old" "  - Removing old: $old"
       rm -f "$old" "${old}.sha256" "${old%.img*}.sfdisk" 2>/dev/null || true
     done
   fi
@@ -189,63 +212,58 @@ find_latest_valid() {
     "$dir"/panzer_*.img.zst     "$dir"/panzer_*.img 2>/dev/null || true)
   for img in "${IMGS[@]:-}"; do
     [[ -f "${img}.sha256" ]] || continue
-    msg "  - Prüfe $(basename "$img") ..."
+    M "  - Prüfe $(basename "$img") ..." "  - Checking $(basename "$img") ..."
     ( cd "$dir" && sha256sum -c "$(basename "$img").sha256" >/dev/null ) && { echo "$img"; return 0; }
   done
   return 1
 }
+find_latest_any() { local dir="${1:?}"; ls -1t "$dir"/panzer_*.img.zst.gpg "$dir"/panzer_*.img.gpg "$dir"/panzer_*.img.zst "$dir"/panzer_*.img 2>/dev/null | head -n1 || true; }
 
-find_latest_any() {
-  local dir="${1:?}"
-  ls -1t "$dir"/panzer_*.img.zst.gpg "$dir"/panzer_*.img.gpg "$dir"/panzer_*.img.zst "$dir"/panzer_*.img 2>/dev/null | head -n1 || true
-}
-
-# === zstd ggf. installieren ===
+# =====================[ zstd ensure ]========================================
 ensure_zstd_if_needed() {
-  local want="$1"  # "on"|"auto"|"off"
-  if [[ "$want" == "off" ]]; then return 0; fi
-  if has_cmd zstd; then return 0; fi
+  local want="$1"  # on|auto|off
+  [[ "$want" == "off" ]] && return 0
+  has_cmd zstd && return 0
   if [[ "$want" == "on" || "$want" == "auto" ]]; then
-    msg "[*] zstd ist nicht installiert."
-    if ask "Soll ich zstd automatisch installieren (apt)?"; then
+    msg "[*] zstd ist nicht installiert." "[*] zstd is not installed."
+    if ASK "Soll ich zstd automatisch installieren (apt)?" "Install zstd automatically (apt)?"; then
       need_cmd apt-get
       DEBIAN_FRONTEND=noninteractive apt-get update -y || true
       DEBIAN_FRONTEND=noninteractive apt-get install -y zstd || true
       if ! has_cmd zstd; then
-        [[ "$want" == "on" ]] && die "Kompression gefordert, aber zstd konnte nicht installiert werden."
-        msg "[!] zstd nicht verfügbar – fahre ohne Kompression fort."
+        [[ "$want" == "on" ]] && die "Kompression gefordert, aber zstd konnte nicht installiert werden." "Compression required, but zstd could not be installed."
+        msg "[!] zstd nicht verfügbar – fahre ohne Kompression fort." "[!] zstd not available – continuing without compression."
       else
-        msg "[✓] zstd installiert."
+        msg "[✓] zstd installiert." "[✓] zstd installed."
       fi
     else
-      [[ "$want" == "on" ]] && die "Kompression gewünscht, aber zstd fehlt."
-      msg "[!] zstd nicht installiert – fahre ohne Kompression fort."
+      [[ "$want" == "on" ]] && die "Kompression gewünscht, aber zstd fehlt." "Compression requested, but zstd is missing."
+      msg "[!] zstd nicht installiert – fahre ohne Kompression fort." "[!] zstd not installed – continuing without compression."
     fi
   fi
 }
 
-# ===== Proxmox Quiesce (VMs/CTs) – QGA fsfreeze / suspend =====
+# =====================[ Proxmox Quiesce (VM/CT) ]============================
 declare -a RUN_QM RUN_CT FROZEN_QM SUSPENDED_QM
-
 pve_quiesce_start() {
   FROZEN_QM=(); SUSPENDED_QM=()
   if ! has_cmd qm && ! has_cmd pct; then return 0; fi
-  msg "[*] Proxmox erkannt – beginne Quiesce"
+  msg "[*] Proxmox erkannt – beginne Quiesce" "[*] Proxmox detected – starting quiesce"
 
   if has_cmd qm; then
     mapfile -t RUN_QM < <(qm list 2>/dev/null | awk 'NR>1 && $3=="running"{print $1}')
     for vm in "${RUN_QM[@]:-}"; do
       if qm agent "$vm" ping >/dev/null 2>&1; then
-        msg "  - VM $vm: QGA ok → fsfreeze-freeze"
+        msg "  - VM $vm: QGA ok → fsfreeze-freeze" "  - VM $vm: QGA ok → fsfreeze-freeze"
         if qm agent "$vm" fsfreeze-freeze >/dev/null 2>&1; then
           FROZEN_QM+=("$vm")
         else
-          msg "    ! freeze fehlgeschlagen → fallback suspend"
+          msg "    ! freeze fehlgeschlagen → fallback suspend" "    ! freeze failed → falling back to suspend"
           qm suspend "$vm" >/dev/null 2>&1 || true
           SUSPENDED_QM+=("$vm")
         fi
       else
-        msg "  - VM $vm: kein QGA → suspend"
+        msg "  - VM $vm: kein QGA → suspend" "  - VM $vm: no QGA → suspend"
         qm suspend "$vm" >/dev/null 2>&1 || true
         SUSPENDED_QM+=("$vm")
       fi
@@ -255,42 +273,40 @@ pve_quiesce_start() {
   if has_cmd pct; then
     mapfile -t RUN_CT < <(pct list 2>/dev/null | awk 'NR>1 && $2=="running"{print $1}')
     for ct in "${RUN_CT[@]:-}"; do
-      msg "  - CT $ct: freeze"
+      msg "  - CT $ct: freeze" "  - CT $ct: freeze"
       pct freeze "$ct" >/dev/null 2>&1 || true
     done
   fi
 
   trap 'pve_quiesce_end' EXIT
 }
-
 pve_quiesce_end() {
   if has_cmd qm; then
     for vm in "${FROZEN_QM[@]:-}"; do
-      msg "  - VM $vm: fsfreeze-thaw"
+      msg "  - VM $vm: fsfreeze-thaw" "  - VM $vm: fsfreeze-thaw"
       qm agent "$vm" fsfreeze-thaw >/dev/null 2>&1 || true
     done
     for vm in "${SUSPENDED_QM[@]:-}"; do
-      msg "  - VM $vm: resume"
+      msg "  - VM $vm: resume" "  - VM $vm: resume"
       qm resume "$vm" >/dev/null 2>&1 || true
     done
   fi
   if has_cmd pct; then
     for ct in "${RUN_CT[@]:-}"; do
-      msg "  - CT $ct: unfreeze"
+      msg "  - CT $ct: unfreeze" "  - CT $ct: unfreeze"
       pct unfreeze "$ct" >/dev/null 2>&1 || true
     done
   fi
 }
 
-# ===== Auto-Detection =====
+# =====================[ Auto-Detection / Defaults ]==========================
 BACKUP_LABEL="${BACKUP_LABEL:-PANZERBACKUP}"
 DISK="${DISK_OVERRIDE:-$(detect_system_disk || true)}"
-[[ -b "${DISK:-}" ]] || die "Konnte Systemdisk nicht ermitteln"
+[[ -b "${DISK:-}" ]] || die "Konnte Systemdisk nicht ermitteln" "Could not determine system disk"
 SELECT_BACKUP="${SELECT_BACKUP:-""}"
 BACKUP_DIR="$(detect_backup_dir "$BACKUP_LABEL" || true)"
-[[ -d "${BACKUP_DIR:-}" && -w "$BACKUP_DIR" ]] || die "Backup-Platte mit Label $BACKUP_LABEL nicht gefunden/ nicht schreibbar"
+[[ -d "${BACKUP_DIR:-}" && -w "$BACKUP_DIR" ]] || die "Backup-Platte mit Label $BACKUP_LABEL nicht gefunden/ nicht schreibbar" "Backup drive with label $BACKUP_LABEL not found / not writable"
 
-# ===== Defaults / Optionen =====
 KEEP="${KEEP:-3}"
 DATE="$(date +'%Y-%m-%d_%H-%M-%S')"
 IMG_PREFIX="panzer_${DATE}"
@@ -304,39 +320,48 @@ SELECT_DISK=""
 ENCRYPT_MODE="off"
 ENCRYPT_PASSPHRASE=""
 
-# ===== Prompts =====
+# =====================[ Prompts ]============================================
 prompt_post_action() {
   echo
-  echo "Aktion NACH dem ${1:-Vorgang}?"
-  echo "1) Nichts tun"
-  echo "2) Neu starten"
-  echo "3) Herunterfahren"
-  read -rp "Auswahl (1/2/3): " pa
+  if [[ "$LANG_CHOICE" == "de" ]]; then
+    echo "Aktion NACH dem ${1:-Vorgang}?"
+    echo "1) Nichts tun"; echo "2) Neu starten"; echo "3) Herunterfahren"
+    read -rp "Auswahl (1/2/3): " pa
+  else
+    echo "Action AFTER ${1:-operation}?"
+    echo "1) Do nothing"; echo "2) Reboot"; echo "3) Shutdown"
+    read -rp "Choice (1/2/3): " pa
+  fi
   case "$pa" in
     2) POST_ACTION="reboot" ;;
     3) POST_ACTION="shutdown" ;;
     *) POST_ACTION="none" ;;
   esac
   POST_ACTION_PRESET="1"
-  msg "→ Post-Action: $POST_ACTION"
+  msg "→ Post-Action: $POST_ACTION" "→ Post-action: $POST_ACTION"
 }
-
 prompt_encryption() {
-  if ask "Backup verschlüsseln (GnuPG AES-256)?"; then
+  if ASK "Backup verschlüsseln (GnuPG AES-256)?" "Encrypt backup (GnuPG AES-256)?" ; then
     need_cmd gpg
     ENCRYPT_MODE="gpg"
-    read -rsp "Passphrase: " p1; echo
-    read -rsp "Passphrase wiederholen: " p2; echo
-    [[ "$p1" == "$p2" ]] || die "Passphrasen stimmen nicht überein"
+    if [[ "$LANG_CHOICE" == "de" ]]; then
+      read -rsp "Passphrase: " p1; echo
+      read -rsp "Passphrase wiederholen: " p2; echo
+      [[ "$p1" == "$p2" ]] || die "Passphrasen stimmen nicht überein" "Passphrases do not match"
+    else
+      read -rsp "Passphrase: " p1; echo
+      read -rsp "Repeat passphrase: " p2; echo
+      [[ "$p1" == "$p2" ]] || die "Passphrases do not match" "Passphrasen stimmen nicht überein"
+    fi
     ENCRYPT_PASSPHRASE="$p1"; unset p1 p2
-    msg "→ Verschlüsselung: aktiv (gpg)"
+    msg "→ Verschlüsselung: aktiv (gpg)" "→ Encryption: enabled (gpg)"
   else
     ENCRYPT_MODE="off"
-    msg "→ Verschlüsselung: aus"
+    msg "→ Verschlüsselung: aus" "→ Encryption: off"
   fi
 }
 
-# ===== Argument-Parser =====
+# =====================[ Arg Parser ]=========================================
 parse_backup_flags() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -354,7 +379,6 @@ parse_backup_flags() {
   done
   printf '%s\0' "$@"
 }
-
 parse_restore_flags() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -371,7 +395,7 @@ parse_restore_flags() {
   printf '%s\0' "$@"
 }
 
-# ===== Backup =====
+# =====================[ Backup ]=============================================
 do_backup() {
   need_cmd dd; need_cmd sha256sum; need_cmd sfdisk
   ensure_zstd_if_needed "$COMPRESS_MODE"
@@ -387,15 +411,16 @@ do_backup() {
   local temp_file="${final_file}.part"
   local temp_sha="${final_file}.sha256.part"
 
-  msg "=== $(date) | Starte Panzer-Backup von $DISK -> $final_file" | tee -a "$BACKUP_DIR/panzerbackup.log"
+  msg "=== $(date) | Starte Panzer-Backup von $DISK -> $final_file" \
+      "=== $(date) | Starting panzer-backup from $DISK -> $final_file" | tee -a "$BACKUP_DIR/panzerbackup.log"
 
   pve_quiesce_start
   sfdisk -d "$DISK" > "${BACKUP_DIR}/${IMG_PREFIX}.sfdisk"
 
   set -o pipefail
   if [[ "$use_compress" == "true" && "$ENCRYPT_MODE" == "gpg" ]]; then
-    msg "[*] dd | zstd | gpg | tee | sha256sum …"
-    run_inhibited "Panzerbackup läuft" bash -c '
+    msg "[*] dd | zstd | gpg | tee | sha256sum …" "[*] dd | zstd | gpg | tee | sha256sum …"
+    run_inhibited "Panzerbackup läuft / Panzerbackup running" bash -c '
       dd if='"$DISK"' bs=64M status=progress 2>/dev/null \
       | zstd -T0 -'"$ZSTD_LEVEL"' -q \
       | gpg --batch --yes --symmetric --cipher-algo AES256 --pinentry-mode loopback --passphrase-fd 3 3<<<"'"$ENCRYPT_PASSPHRASE"'" \
@@ -404,8 +429,8 @@ do_backup() {
       | awk '"'"'{print $1"  '"$(basename "$final_file")"'"}'"'"' > "'"$temp_sha"'"
     '
   elif [[ "$use_compress" == "true" ]]; then
-    msg "[*] dd | zstd | tee | sha256sum …"
-    run_inhibited "Panzerbackup läuft" bash -c '
+    msg "[*] dd | zstd | tee | sha256sum …" "[*] dd | zstd | tee | sha256sum …"
+    run_inhibited "Panzerbackup läuft / Panzerbackup running" bash -c '
       dd if='"$DISK"' bs=64M status=progress 2>/dev/null \
       | zstd -T0 -'"$ZSTD_LEVEL"' -q \
       | tee "'"$temp_file"'" \
@@ -413,8 +438,8 @@ do_backup() {
       | awk '"'"'{print $1"  '"$(basename "$final_file")"'"}'"'"' > "'"$temp_sha"'"
     '
   elif [[ "$ENCRYPT_MODE" == "gpg" ]]; then
-    msg "[*] dd | gpg | tee | sha256sum …"
-    run_inhibited "Panzerbackup läuft" bash -c '
+    msg "[*] dd | gpg | tee | sha256sum …" "[*] dd | gpg | tee | sha256sum …"
+    run_inhibited "Panzerbackup läuft / Panzerbackup running" bash -c '
       dd if='"$DISK"' bs=64M status=progress 2>/dev/null \
       | gpg --batch --yes --symmetric --cipher-algo AES256 --pinentry-mode loopback --passphrase-fd 3 3<<<"'"$ENCRYPT_PASSPHRASE"'" \
       | tee "'"$temp_file"'" \
@@ -422,8 +447,8 @@ do_backup() {
       | awk '"'"'{print $1"  '"$(basename "$final_file")"'"}'"'"' > "'"$temp_sha"'"
     '
   else
-    msg "[*] dd (roh) | tee | sha256sum …"
-    run_inhibited "Panzerbackup läuft" bash -c '
+    msg "[*] dd (roh) | tee | sha256sum …" "[*] dd (raw) | tee | sha256sum …"
+    run_inhibited "Panzerbackup läuft / Panzerbackup running" bash -c '
       dd if='"$DISK"' bs=64M status=progress 2>/dev/null \
       | tee "'"$temp_file"'" \
       | sha256sum -b \
@@ -436,88 +461,90 @@ do_backup() {
   mv -f "$temp_file" "$final_file"
   mv -f "$temp_sha"  "${final_file}.sha256"
 
-  msg "[✓] Datei: $(du -h "$final_file" | cut -f1)   Hash: $(cut -d' ' -f1 "${final_file}.sha256")"
+  msg "[✓] Datei: $(du -h "$final_file" | cut -f1)   Hash: $(cut -d' ' -f1 "${final_file}.sha256")" \
+      "[✓] File:  $(du -h "$final_file" | cut -f1)   Hash: $(cut -d' ' -f1 "${final_file}.sha256")"
 
   ln -sfn "$(basename "$final_file")"        "${BACKUP_DIR}/LATEST_OK"
   ln -sfn "$(basename "$final_file").sha256" "${BACKUP_DIR}/LATEST_OK.sha256"
   ln -sfn "panzer_${DATE}.sfdisk"            "${BACKUP_DIR}/LATEST_OK.sfdisk"
 
   rotate_old "$BACKUP_DIR" "$KEEP"
-  msg "=== $(date) | Backup erfolgreich abgeschlossen ==="
+  msg "=== $(date) | Backup erfolgreich abgeschlossen ===" "=== $(date) | Backup completed successfully ==="
   post_action_maybe "backup"
 
   ENCRYPT_PASSPHRASE=""
 }
 
-# ===== Verify =====
+# =====================[ Verify ]=============================================
 do_verify() {
   need_cmd sha256sum
-  msg "=== $(date) | Prüfe letztes Backup ==="
-  local CAND
-  CAND="$(find_latest_any "$BACKUP_DIR" || true)"
-  [[ -n "${CAND:-}" ]] || die "Keine Backup-Datei gefunden"
-  msg "Datei: $(basename "$CAND") | Größe: $(du -h "$CAND" | cut -f1)"
+  msg "=== $(date) | Prüfe letztes Backup ===" "=== $(date) | Verifying last backup ==="
+  local CAND; CAND="$(find_latest_any "$BACKUP_DIR" || true)"
+  [[ -n "${CAND:-}" ]] || die "Keine Backup-Datei gefunden" "No backup file found"
+  msg "Datei: $(basename "$CAND") | Größe: $(du -h "$CAND" | cut -f1)" \
+      "File:  $(basename "$CAND") | Size:  $(du -h "$CAND" | cut -f1)"
   ( cd "$BACKUP_DIR" && sha256sum -c "$(basename "$CAND").sha256" )
-  msg "=== Verify OK ==="
+  msg "=== Verify OK ===" "=== Verify OK ==="
 }
 
-# ===== Restore =====
+# =====================[ Restore ]============================================
 do_restore() {
   need_cmd dd; need_cmd sha256sum; need_cmd lsblk; need_cmd mount; need_cmd chroot
-
   local restore_disk="${DISK}"
   if [[ -n "${TARGET_DISK:-}" ]]; then
-    restore_disk="$TARGET_DISK"; [[ -b "$restore_disk" ]] || die "Angegebene Ziel-Disk nicht gefunden: $restore_disk"
+    restore_disk="$TARGET_DISK"; [[ -b "$restore_disk" ]] || die "Angegebene Ziel-Disk nicht gefunden: $restore_disk" "Target disk not found: $restore_disk"
   elif [[ "${SELECT_DISK:-}" == "true" ]]; then
     restore_disk="$(select_target_disk "$DISK")"
   fi
-  msg "=== $(date) | Starte Restore ${RESTORE_DRY_RUN:+(Dry-Run)} auf $restore_disk ==="
+  msg "=== $(date) | Starte Restore ${RESTORE_DRY_RUN:+(Dry-Run)} auf $restore_disk ===" \
+      "=== $(date) | Starting restore ${RESTORE_DRY_RUN:+(dry-run)} to $restore_disk ==="
 
-  local CANDIDATE; CANDIDATE="$(find_latest_valid "$BACKUP_DIR" || true)" || die "Kein gültiges Backup gefunden"
-  msg "[✓] Verwende: $(basename "$CANDIDATE")"
+  local CANDIDATE; CANDIDATE="$(find_latest_valid "$BACKUP_DIR" || true)" || die "Kein gültiges Backup gefunden" "No valid backup found"
+  msg "[✓] Verwende: $(basename "$CANDIDATE")" "[✓] Using: $(basename "$CANDIDATE")"
 
   if [[ "$RESTORE_DRY_RUN" == "--dry-run" ]]; then
-    msg "[DRY-RUN] Würde $(basename "$CANDIDATE") auf $restore_disk schreiben."
+    msg "[DRY-RUN] Würde $(basename "$CANDIDATE") auf $restore_disk schreiben." \
+        "[DRY-RUN] Would write $(basename "$CANDIDATE") to $restore_disk."
     return 0
   fi
 
-  msg "⚠️  ALLE DATEN auf $restore_disk werden überschrieben!"
-  ask "Willst du das Restore wirklich starten?" || { msg "Abbruch."; return 3; }
+  M "⚠️  ALLE DATEN auf $restore_disk werden überschrieben!" "⚠️  ALL DATA on $restore_disk will be overwritten!"
+  ASK "Willst du das Restore wirklich starten?" "Do you really want to start the restore?" || { msg "Abbruch." "Aborted."; return 3; }
 
   set -o pipefail
   if [[ "$CANDIDATE" == *.gpg ]]; then
     need_cmd gpg
     if [[ -z "${ENCRYPT_PASSPHRASE:-}" ]]; then
-      read -rsp "GPG-Passphrase für Restore: " ENCRYPT_PASSPHRASE; echo
+      if [[ "$LANG_CHOICE" == "de" ]]; then read -rsp "GPG-Passphrase für Restore: " ENCRYPT_PASSPHRASE; echo
+      else read -rsp "GPG passphrase for restore: " ENCRYPT_PASSPHRASE; echo; fi
     fi
     if [[ "$CANDIDATE" == *.zst.gpg ]]; then
-      msg "[*] gpg -d | zstd -d | dd …"
-      run_inhibited "Panzer-RESTORE läuft" bash -c \
+      msg "[*] gpg -d | zstd -d | dd …" "[*] gpg -d | zstd -d | dd …"
+      run_inhibited "Panzer-RESTORE läuft / running" bash -c \
         'gpg --batch --yes --decrypt --pinentry-mode loopback --passphrase-fd 3 3<<<"'"$ENCRYPT_PASSPHRASE"'" "'"$CANDIDATE"'" \
          | zstd -d -q \
          | dd of="'"$restore_disk"'" bs=64M status=progress conv=fsync'
     else
-      msg "[*] gpg -d | dd …"
-      run_inhibited "Panzer-RESTORE läuft" bash -c \
+      msg "[*] gpg -d | dd …" "[*] gpg -d | dd …"
+      run_inhibited "Panzer-RESTORE läuft / running" bash -c \
         'gpg --batch --yes --decrypt --pinentry-mode loopback --passphrase-fd 3 3<<<"'"$ENCRYPT_PASSPHRASE"'" "'"$CANDIDATE"'" \
          | dd of="'"$restore_disk"'" bs=64M status=progress conv=fsync'
     fi
     ENCRYPT_PASSPHRASE=""
   elif [[ "$CANDIDATE" == *.zst ]]; then
     need_cmd zstd
-    msg "[*] zstd -d | dd …"
-    run_inhibited "Panzer-RESTORE läuft" bash -c \
+    msg "[*] zstd -d | dd …" "[*] zstd -d | dd …"
+    run_inhibited "Panzer-RESTORE läuft / running" bash -c \
       'zstd -d -q "'"$CANDIDATE"'" \
        | dd of="'"$restore_disk"'" bs=64M status=progress conv=fsync'
   else
-    msg "[*] dd (roh) …"
-    run_inhibited "Panzer-RESTORE läuft" dd if="$CANDIDATE" of="$restore_disk" bs=64M status=progress conv=fsync
+    msg "[*] dd (roh) …" "[*] dd (raw) …"
+    run_inhibited "Panzer-RESTORE läuft / running" dd if="$CANDIDATE" of="$restore_disk" bs=64M status=progress conv=fsync
   fi
   set +o pipefail
 
-  # Boot-Reparatur nur wenn auf Systemdisk restored
   if [[ "$restore_disk" == "$DISK" ]]; then
-    msg "[*] Versuche GRUB zu erneuern …"
+    msg "[*] Versuche GRUB zu erneuern …" "[*] Attempting GRUB repair …"
     local ROOT_CAND
     ROOT_CAND="$(lsblk -lnpo NAME,TYPE | awk '/lvm/ && /root/{print $1; exit}')"
     if [[ -z "$ROOT_CAND" ]]; then
@@ -535,44 +562,55 @@ do_restore() {
       for d in /dev /proc /sys; do mount --bind "$d" "/mnt/restore${d}"; done
       chroot /mnt/restore bash -c "grub-install $restore_disk || true; update-grub || true"
     else
-      msg "[!] Root-Partition nicht sicher erkannt – GRUB-Reparatur übersprungen."
+      msg "[!] Root-Partition nicht sicher erkannt – GRUB-Reparatur übersprungen." "[!] Root partition not reliably detected – skipping GRUB repair."
     fi
   else
-    msg "[*] Restore auf anderer Disk – GRUB-Installation übersprungen."
+    msg "[*] Restore auf anderer Disk – GRUB-Installation übersprungen." "[*] Restore to different disk – skipping GRUB installation."
   fi
 
-  msg "[✓] Restore abgeschlossen."
+  msg "[✓] Restore abgeschlossen." "[✓] Restore completed."
   post_action_maybe "restore"
 }
 
-# ===== Post-Action =====
+# =====================[ Post-Action ]========================================
 post_action_maybe() {
   local phase="$1"
   case "$POST_ACTION" in
-    reboot)   msg "[*] Neustart in 5 Sekunden ..."; sleep 5; systemctl reboot ;;
-    shutdown) msg "[*] Shutdown in 5 Sekunden ..."; sleep 5; systemctl poweroff ;;
+    reboot)
+      msg "[*] Neustart in 5 Sekunden ..." "[*] Rebooting in 5 seconds ..."
+      sleep 5; systemctl reboot ;;
+    shutdown)
+      msg "[*] Shutdown in 5 Sekunden ..." "[*] Shutting down in 5 seconds ..."
+      sleep 5; systemctl poweroff ;;
     none|"")
-              if [[ -z "${POST_ACTION_PRESET:-}" && -t 0 && -t 1 ]]; then
-                echo; echo "Aktion nach $phase?"
-                echo "1) Nichts tun"; echo "2) Neu starten"; echo "3) Herunterfahren"
-                read -rp "Auswahl (1/2/3): " pa
-                case "$pa$phase" in
-                  2*) systemctl reboot ;;
-                  3*) systemctl poweroff ;;
-                  *)  : ;;
-                esac
-              fi
-              ;;
+      if [[ -z "${POST_ACTION_PRESET:-}" && -t 0 && -t 1 ]]; then
+        echo
+        if [[ "$LANG_CHOICE" == "de" ]]; then
+          echo "Aktion nach $phase?"; echo "1) Nichts tun"; echo "2) Neu starten"; echo "3) Herunterfahren"
+          read -rp "Auswahl (1/2/3): " pa
+        else
+          echo "Action after $phase?"; echo "1) Do nothing"; echo "2) Reboot"; echo "3) Shutdown"
+          read -rp "Choice (1/2/3): " pa
+        fi
+        case "$pa$phase" in
+          2*) systemctl reboot ;;
+          3*) systemctl poweroff ;;
+          *)  : ;;
+        esac
+      fi
+      ;;
   esac
 }
 
+# =====================[ Usage / Hilfe ]======================================
 print_usage() {
-  cat <<USAGE
-Detected:
+  if [[ "$LANG_CHOICE" == "de" ]]; then
+cat <<USAGE
+Erkannt:
   Systemdisk:  $DISK
   Backup-Ziel: $BACKUP_DIR
 
-Usage:
+Aufruf:
   $0 backup  [--compress|--no-compress] [--zstd-level N] [--encrypt|--no-encrypt] [--passfile FILE] [--post reboot|shutdown|none] [--select-backup] [--disk /dev/XYZ]
   $0 restore [--dry-run] [--select-disk] [--target /dev/sdX] [--post reboot|shutdown|none] [--passfile FILE] [--select-backup] [--disk /dev/XYZ]
   $0 verify
@@ -583,9 +621,27 @@ Hinweise:
 - Backup-Ziel: Label case-insensitive **Teilstring** (z.B. "PANZERBACKUP" matcht "panzerbackup-pm").
 - Dateien: .img[.zst][.gpg] + .sha256; LATEST_OK Symlink + .sfdisk.
 USAGE
+  else
+cat <<USAGE
+Detected:
+  System disk:  $DISK
+  Backup dir:   $BACKUP_DIR
+
+Usage:
+  $0 backup  [--compress|--no-compress] [--zstd-level N] [--encrypt|--no-encrypt] [--passfile FILE] [--post reboot|shutdown|none] [--select-backup] [--disk /dev/XYZ]
+  $0 restore [--dry-run] [--select-disk] [--target /dev/sdX] [--post reboot|shutdown|none] [--passfile FILE] [--select-backup] [--disk /dev/XYZ]
+  $0 verify
+  $0                                     # interactive menu
+
+Notes:
+- Proxmox VMs: QGA → fsfreeze; otherwise suspend. CTs: freeze.
+- Backup target: label case-insensitive **substring** (e.g., "PANZERBACKUP" matches "panzerbackup-pm").
+- Files: .img[.zst][.gpg] + .sha256; LATEST_OK symlink + .sfdisk.
+USAGE
+  fi
 }
 
-# ===== Einstieg =====
+# =====================[ Entry / Menü ]=======================================
 if [[ $# -gt 0 ]]; then
   case "$1" in
     backup)
@@ -594,32 +650,42 @@ if [[ $# -gt 0 ]]; then
         [[ -z "${POST_ACTION_PRESET:-}" ]] && prompt_post_action "Backup"
         if [[ "${ENCRYPT_MODE}" == "off" && -z "${ENCRYPT_PASSPHRASE}" ]]; then prompt_encryption; fi
       fi
-      do_backup
-      ;;
+      do_backup ;;
     restore)
       shift; REMAINS=($(parse_restore_flags "$@"))
       if [[ -t 0 && -t 1 && -z "${POST_ACTION_PRESET:-}" ]]; then
         prompt_post_action "Restore"
       fi
-      do_restore
-      ;;
+      do_restore ;;
     verify)
-      do_verify
-      ;;
+      do_verify ;;
     *)
       print_usage; exit 1 ;;
   esac
 else
-  echo "Systemdisk erkannt:  $DISK"
-  echo "Backup-Ziel:         $BACKUP_DIR"
-  echo "1) Backup (auto-Kompression, Inhibit-Schutz)"
-  echo "2) Restore letztes gültiges Backup"
-  echo "3) Restore (Dry-Run/Prüfung)"
-  echo "4) Backup ohne Kompression"
-  echo "5) Backup mit Kompression (zstd)"
-  echo "6) Restore mit Disk-Auswahl"
-  echo "7) Verify letztes Backup"
-  read -rp "Auswahl (1/2/3/4/5/6/7): " choice
+  if [[ "$LANG_CHOICE" == "de" ]]; then
+    echo "Systemdisk erkannt:  $DISK"
+    echo "Backup-Ziel:         $BACKUP_DIR"
+    echo "1) Backup (auto-Kompression, Inhibit-Schutz)"
+    echo "2) Restore letztes gültiges Backup"
+    echo "3) Restore (Dry-Run/Prüfung)"
+    echo "4) Backup ohne Kompression"
+    echo "5) Backup mit Kompression (zstd)"
+    echo "6) Restore mit Disk-Auswahl"
+    echo "7) Verify letztes Backup"
+    read -rp "Auswahl (1/2/3/4/5/6/7): " choice
+  else
+    echo "System disk: $DISK"
+    echo "Backup dir:  $BACKUP_DIR"
+    echo "1) Backup (auto-compression, inhibit-protection)"
+    echo "2) Restore latest valid backup"
+    echo "3) Restore (dry-run / verify only)"
+    echo "4) Backup without compression"
+    echo "5) Backup with compression (zstd)"
+    echo "6) Restore with disk selection"
+    echo "7) Verify latest backup"
+    read -rp "Choice (1/2/3/4/5/6/7): " choice
+  fi
   case "$choice" in
     1) COMPRESS_MODE="auto";  prompt_post_action "Backup";  prompt_encryption; do_backup ;;
     2)                        prompt_post_action "Restore"; do_restore ;;
@@ -628,6 +694,6 @@ else
     5) COMPRESS_MODE="on";    prompt_post_action "Backup";  prompt_encryption; do_backup ;;
     6) SELECT_DISK="true";    prompt_post_action "Restore"; do_restore ;;
     7) do_verify ;;
-    *) echo "Ungültige Auswahl"; exit 1 ;;
+    *) if [[ "$LANG_CHOICE" == "de" ]]; then echo "Ungültige Auswahl"; else echo "Invalid selection"; fi; exit 1 ;;
   esac
 fi
