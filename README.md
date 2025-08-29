@@ -1,7 +1,3 @@
-# panzerbackup
-Disaster Recovery Backup Script for Linux &amp; Proxmox. Automated 1:1 disk image with compression, optional GPG encryption,  integrity verification and restore support.
-
-
 # Panzerbackup
 
 A disaster recovery backup script for Linux and Proxmox.  
@@ -15,7 +11,17 @@ It creates a full 1:1 disk image of the system while running, with support for:
 - **Easy restore** to original or alternative disks
 - **Post actions** (shutdown / reboot / none)
 
+---
+
 ## Usage
+
+You can either run Panzerbackup directly into the **interactive main menu**:
+
+```bash
+./panzerbackup.sh
+```
+
+Or you can call it with specific commands:
 
 ```bash
 # Backup (auto-detect, compress if possible)
@@ -32,3 +38,19 @@ It creates a full 1:1 disk image of the system while running, with support for:
 
 # Verify latest backup
 ./panzerbackup.sh verify
+```
+
+---
+
+## Features
+
+- Runs online without downtime (quiescing ensures consistency).
+- Designed for both **Proxmox servers** and **regular Linux desktops/servers**.
+- Backup rotation with symlink `LATEST_OK`.
+- Works as a "fire and forget" replacement for Clonezilla.
+
+---
+
+## License
+
+MIT License – feel free to use, share, and improve.
