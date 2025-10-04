@@ -189,6 +189,38 @@ detect_backup_dir() {
   return 1
 }
 
+# =====================[ Backup-Name Prompt ]=================================
+prompt_backup_name() {
+  local default_name="$1"
+  if [[ -n "${BACKUP_NAME:-}" ]]; then
+    echo "$BACKUP_NAME"
+    return 0
+  fi
+  
+  if [[ -t 0 && -t 1 ]]; then
+    echo
+    if [[ "$LANG_CHOICE" == "de" ]]; then
+      read -rp "Backup-Name eingeben (z.B. 'proxmox-host1') [Standard: $default_name]: " input_name
+    else
+      read -rp "Enter backup name (e.g. 'proxmox-host1') [Default: $default_name]: " input_name
+    fi
+    
+    if [[ -z "$input_name" ]]; then
+      echo "$default_name"
+    else
+      # Sanitize input: nur alphanumerisch, Bindestrich, Unterstrich
+      local sanitized="${input_name//[^[:alnum:]\-_]/}"
+      if [[ "$sanitized" != "$input_name" ]]; then
+        M "[!] Name wurde bereinigt: $input_name → $sanitized" \
+          "[!] Name was sanitized: $input_name → $sanitized"
+      fi
+      echo "$sanitized"
+    fi
+  else
+    echo "$default_name"
+  fi
+}
+
 rotate_old() {
   local dir="${1:?}"; local keep="${2:?}"
   mapfile -t ALL < <(ls -1t \
@@ -309,7 +341,8 @@ BACKUP_DIR="$(detect_backup_dir "$BACKUP_LABEL" || true)"
 
 KEEP="${KEEP:-3}"
 DATE="$(date +'%Y-%m-%d_%H-%M-%S')"
-IMG_PREFIX="panzer_${DATE}"
+BACKUP_NAME="${BACKUP_NAME:-}"
+IMG_PREFIX=""
 COMPRESS_MODE="auto"
 ZSTD_LEVEL="${ZSTD_LEVEL:-6}"
 POST_ACTION="none"
@@ -351,7 +384,7 @@ prompt_encryption() {
     else
       read -rsp "Passphrase: " p1; echo
       read -rsp "Repeat passphrase: " p2; echo
-      [[ "$p1" == "$p2" ]] || die "Passphrases do not match" "Passphrasen stimmen nicht überein"
+      [[ "$p1" == "$p2" ]] || die "Passphrases do not match" "Passphrases do not match"
     fi
     ENCRYPT_PASSPHRASE="$p1"; unset p1 p2
     msg "→ Verschlüsselung: aktiv (gpg)" "→ Encryption: enabled (gpg)"
@@ -374,6 +407,7 @@ parse_backup_flags() {
       --passfile)      ENCRYPT_PASSPHRASE="$(<"$2")"; shift 2 ;;
       --select-backup) SELECT_BACKUP="true"; shift ;;
       --disk)          DISK="$2"; shift 2 ;;
+      --name)          BACKUP_NAME="$2"; shift 2 ;;
       *) break ;;
     esac
   done
@@ -399,6 +433,13 @@ parse_restore_flags() {
 do_backup() {
   need_cmd dd; need_cmd sha256sum; need_cmd sfdisk
   ensure_zstd_if_needed "$COMPRESS_MODE"
+
+  # Backup-Name ermitteln
+  local default_name="$(hostname -s 2>/dev/null || echo 'system')"
+  local backup_name="$(prompt_backup_name "$default_name")"
+  IMG_PREFIX="panzer_${backup_name}_${DATE}"
+  
+  msg "→ Backup-Name: $backup_name" "→ Backup name: $backup_name"
 
   local use_compress="false"
   if [[ "$COMPRESS_MODE" == "on" ]]; then use_compress="true"
@@ -466,7 +507,7 @@ do_backup() {
 
   ln -sfn "$(basename "$final_file")"        "${BACKUP_DIR}/LATEST_OK"
   ln -sfn "$(basename "$final_file").sha256" "${BACKUP_DIR}/LATEST_OK.sha256"
-  ln -sfn "panzer_${DATE}.sfdisk"            "${BACKUP_DIR}/LATEST_OK.sfdisk"
+  ln -sfn "${IMG_PREFIX}.sfdisk"             "${BACKUP_DIR}/LATEST_OK.sfdisk"
 
   rotate_old "$BACKUP_DIR" "$KEEP"
   msg "=== $(date) | Backup erfolgreich abgeschlossen ===" "=== $(date) | Backup completed successfully ==="
@@ -611,15 +652,21 @@ Erkannt:
   Backup-Ziel: $BACKUP_DIR
 
 Aufruf:
-  $0 backup  [--compress|--no-compress] [--zstd-level N] [--encrypt|--no-encrypt] [--passfile FILE] [--post reboot|shutdown|none] [--select-backup] [--disk /dev/XYZ]
+  $0 backup  [--name NAME] [--compress|--no-compress] [--zstd-level N] [--encrypt|--no-encrypt] [--passfile FILE] [--post reboot|shutdown|none] [--select-backup] [--disk /dev/XYZ]
   $0 restore [--dry-run] [--select-disk] [--target /dev/sdX] [--post reboot|shutdown|none] [--passfile FILE] [--select-backup] [--disk /dev/XYZ]
   $0 verify
   $0                                     # interaktives Menü
 
 Hinweise:
+- --name NAME: Benutzerdefinierter Backup-Name (z.B. 'proxmox-host1'). Standard: Hostname
 - Proxmox-VMs: QGA → fsfreeze; sonst suspend. CTs: freeze.
 - Backup-Ziel: Label case-insensitive **Teilstring** (z.B. "PANZERBACKUP" matcht "panzerbackup-pm").
-- Dateien: .img[.zst][.gpg] + .sha256; LATEST_OK Symlink + .sfdisk.
+- Dateien: panzer_NAME_DATUM.img[.zst][.gpg] + .sha256; LATEST_OK Symlink + .sfdisk.
+
+Beispiele:
+  $0 backup --name pve-node1 --compress --encrypt
+  $0 backup --name homeserver --no-encrypt --post shutdown
+  BACKUP_NAME=proxmox1 $0 backup --compress
 USAGE
   else
 cat <<USAGE
@@ -628,15 +675,21 @@ Detected:
   Backup dir:   $BACKUP_DIR
 
 Usage:
-  $0 backup  [--compress|--no-compress] [--zstd-level N] [--encrypt|--no-encrypt] [--passfile FILE] [--post reboot|shutdown|none] [--select-backup] [--disk /dev/XYZ]
+  $0 backup  [--name NAME] [--compress|--no-compress] [--zstd-level N] [--encrypt|--no-encrypt] [--passfile FILE] [--post reboot|shutdown|none] [--select-backup] [--disk /dev/XYZ]
   $0 restore [--dry-run] [--select-disk] [--target /dev/sdX] [--post reboot|shutdown|none] [--passfile FILE] [--select-backup] [--disk /dev/XYZ]
   $0 verify
   $0                                     # interactive menu
 
 Notes:
+- --name NAME: Custom backup name (e.g., 'proxmox-host1'). Default: hostname
 - Proxmox VMs: QGA → fsfreeze; otherwise suspend. CTs: freeze.
 - Backup target: label case-insensitive **substring** (e.g., "PANZERBACKUP" matches "panzerbackup-pm").
-- Files: .img[.zst][.gpg] + .sha256; LATEST_OK symlink + .sfdisk.
+- Files: panzer_NAME_DATE.img[.zst][.gpg] + .sha256; LATEST_OK symlink + .sfdisk.
+
+Examples:
+  $0 backup --name pve-node1 --compress --encrypt
+  $0 backup --name homeserver --no-encrypt --post shutdown
+  BACKUP_NAME=proxmox1 $0 backup --compress
 USAGE
   fi
 }
@@ -687,11 +740,29 @@ else
     read -rp "Choice (1/2/3/4/5/6/7): " choice
   fi
   case "$choice" in
-    1) COMPRESS_MODE="auto";  prompt_post_action "Backup";  prompt_encryption; do_backup ;;
+    1) COMPRESS_MODE="auto";  
+       if [[ "$LANG_CHOICE" == "de" ]]; then
+         read -rp "Backup-Name (z.B. 'proxmox-node1') [Standard: $(hostname -s)]: " BACKUP_NAME
+       else
+         read -rp "Backup name (e.g., 'proxmox-node1') [Default: $(hostname -s)]: " BACKUP_NAME
+       fi
+       prompt_post_action "Backup";  prompt_encryption; do_backup ;;
     2)                        prompt_post_action "Restore"; do_restore ;;
     3) RESTORE_DRY_RUN="--dry-run"; prompt_post_action "Restore"; do_restore ;;
-    4) COMPRESS_MODE="off";   prompt_post_action "Backup";  prompt_encryption; do_backup ;;
-    5) COMPRESS_MODE="on";    prompt_post_action "Backup";  prompt_encryption; do_backup ;;
+    4) COMPRESS_MODE="off";   
+       if [[ "$LANG_CHOICE" == "de" ]]; then
+         read -rp "Backup-Name (z.B. 'proxmox-node1') [Standard: $(hostname -s)]: " BACKUP_NAME
+       else
+         read -rp "Backup name (e.g., 'proxmox-node1') [Default: $(hostname -s)]: " BACKUP_NAME
+       fi
+       prompt_post_action "Backup";  prompt_encryption; do_backup ;;
+    5) COMPRESS_MODE="on";    
+       if [[ "$LANG_CHOICE" == "de" ]]; then
+         read -rp "Backup-Name (z.B. 'proxmox-node1') [Standard: $(hostname -s)]: " BACKUP_NAME
+       else
+         read -rp "Backup name (e.g., 'proxmox-node1') [Default: $(hostname -s)]: " BACKUP_NAME
+       fi
+       prompt_post_action "Backup";  prompt_encryption; do_backup ;;
     6) SELECT_DISK="true";    prompt_post_action "Restore"; do_restore ;;
     7) do_verify ;;
     *) if [[ "$LANG_CHOICE" == "de" ]]; then echo "Ungültige Auswahl"; else echo "Invalid selection"; fi; exit 1 ;;
