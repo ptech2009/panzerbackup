@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# =====[ Sane defaults for env -i + set -u ]===================================
+: "${LC_ALL:=C}"; export LC_ALL
+: "${LANG:=C}";   export LANG
+: "${PATH:=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"; export PATH
+: "${HOME:=/root}"; export HOME
+
 # =====================[ Language Selection / Sprachwahl ]=====================
 # Optional: preset via environment, e.g. LANG_CHOICE=en
 LANG_CHOICE="${LANG_CHOICE:-}"
@@ -35,6 +41,29 @@ die() { M "❌ $1" "❌ $2" >&2; exit 1; }          # die "DE" "EN"
 msg() { M "$1" "$2"; }                            # msg "DE" "EN"
 need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Benötigtes Kommando fehlt: $1" "Required command missing: $1"; }
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+# =====================[ Status-Tracking (wie BorgBase Manager) ]==============
+STATUS_FILE="${STATUS_FILE:-/tmp/panzerbackup-status}"
+PID_FILE="${PID_FILE:-/tmp/panzerbackup.pid}"
+
+set_status() { echo "$1" > "$STATUS_FILE"; }
+get_status() { 
+  [[ -s "$STATUS_FILE" ]] && cat "$STATUS_FILE" || {
+    [[ "$LANG_CHOICE" == "en" ]] && echo "Initializing..." || echo "Initialisiere..."
+  }
+}
+clear_status() { rm -f "$STATUS_FILE"; }
+
+is_running() {
+  [[ -f "$PID_FILE" ]] || return 1
+  local pid; pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+  [[ -n "$pid" ]] || { rm -f "$PID_FILE"; return 1; }
+  if ps -p "$pid" >/dev/null 2>&1; then
+    return 0
+  fi
+  rm -f "$PID_FILE"
+  return 1
+}
 
 # =====================[ Power inhibit / Schlaf verhindern ]==================
 run_inhibited() {
@@ -280,6 +309,7 @@ declare -a RUN_QM RUN_CT FROZEN_QM SUSPENDED_QM
 pve_quiesce_start() {
   FROZEN_QM=(); SUSPENDED_QM=()
   if ! has_cmd qm && ! has_cmd pct; then return 0; fi
+  set_status "BACKUP: Proxmox VMs/CTs werden pausiert..."
   msg "[*] Proxmox erkannt – beginne Quiesce" "[*] Proxmox detected – starting quiesce"
 
   if has_cmd qm; then
@@ -313,6 +343,7 @@ pve_quiesce_start() {
   trap 'pve_quiesce_end' EXIT
 }
 pve_quiesce_end() {
+  set_status "BACKUP: VMs/CTs werden fortgesetzt..."
   if has_cmd qm; then
     for vm in "${FROZEN_QM[@]:-}"; do
       msg "  - VM $vm: fsfreeze-thaw" "  - VM $vm: fsfreeze-thaw"
@@ -352,6 +383,13 @@ RESTORE_DRY_RUN=""
 SELECT_DISK=""
 ENCRYPT_MODE="off"
 ENCRYPT_PASSPHRASE=""
+
+# Globale Worker-Variablen
+USE_COMPRESS=""
+FINAL_FILE=""
+TEMP_FILE=""
+TEMP_SHA=""
+LOG_FILE_DEFAULT="${BACKUP_DIR}/panzerbackup.log"
 
 # =====================[ Prompts ]============================================
 prompt_post_action() {
@@ -429,8 +467,231 @@ parse_restore_flags() {
   printf '%s\0' "$@"
 }
 
-# =====================[ Backup ]=============================================
+# =====================[ Backup Worker (Hintergrund) ]=======================
+do_backup_background() {
+  set_status "BACKUP: Wird gestartet..."
+  
+  # Worker-Skript erstellen
+  cat > /tmp/panzerbackup-worker.sh << 'EOFWORKER'
+#!/usr/bin/env bash
+set -euo pipefail
+set -E
+trap 'rc=$?; echo "FEHLER (Backup Worker) in Zeile $LINENO: $BASH_COMMAND (RC=$rc)"; exit $rc' ERR
+
+# Erwartete Variablen via env:
+# DISK BACKUP_DIR IMG_PREFIX FINAL_FILE TEMP_FILE TEMP_SHA USE_COMPRESS ENCRYPT_MODE ENCRYPT_PASSPHRASE ZSTD_LEVEL
+# STATUS_FILE PID_FILE LOG_FILE KEEP LANG_CHOICE
+
+export LC_ALL=C
+: "${PATH:=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
+
+set_status() { echo "$1" > "$STATUS_FILE"; }
+msg() { if [[ "${LANG_CHOICE:-de}" == "de" ]]; then echo "$1"; else echo "$2"; fi; }
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+run_inhibited() {
+  local why="${1:?}"; shift
+  if has_cmd systemd-inhibit; then
+    systemd-inhibit --what=handle-lid-switch:sleep:idle --why="$why" "$@"
+  else
+    "$@"
+  fi
+}
+
+pve_quiesce_start() {
+  FROZEN_QM=(); SUSPENDED_QM=(); RUN_CT=()
+  if ! has_cmd qm && ! has_cmd pct; then return 0; fi
+  set_status "BACKUP: Proxmox VMs/CTs werden pausiert..."
+  msg "[*] Proxmox erkannt – beginne Quiesce" "[*] Proxmox detected – starting quiesce"
+
+  if has_cmd qm; then
+    mapfile -t RUN_QM < <(qm list 2>/dev/null | awk 'NR>1 && $3=="running"{print $1}')
+    for vm in "${RUN_QM[@]:-}"; do
+      if qm agent "$vm" ping >/dev/null 2>&1; then
+        msg "  - VM $vm: QGA ok → fsfreeze-freeze" "  - VM $vm: QGA ok → fsfreeze-freeze"
+        if qm agent "$vm" fsfreeze-freeze >/dev/null 2>&1; then
+          FROZEN_QM+=("$vm")
+        else
+          msg "    ! freeze fehlgeschlagen → fallback suspend" "    ! freeze failed → falling back to suspend"
+          qm suspend "$vm" >/dev/null 2>&1 || true
+          SUSPENDED_QM+=("$vm")
+        fi
+      else
+        msg "  - VM $vm: kein QGA → suspend" "  - VM $vm: no QGA → suspend"
+        qm suspend "$vm" >/dev/null 2>&1 || true
+        SUSPENDED_QM+=("$vm")
+      fi
+    done
+  fi
+
+  if has_cmd pct; then
+    mapfile -t RUN_CT < <(pct list 2>/dev/null | awk 'NR>1 && $2=="running"{print $1}')
+    for ct in "${RUN_CT[@]:-}"; do
+      msg "  - CT $ct: freeze" "  - CT $ct: freeze"
+      pct freeze "$ct" >/dev/null 2>&1 || true
+    done
+  fi
+  trap 'pve_quiesce_end' EXIT
+}
+
+pve_quiesce_end() {
+  set_status "BACKUP: VMs/CTs werden fortgesetzt..."
+  if has_cmd qm; then
+    for vm in "${FROZEN_QM[@]:-}"; do
+      msg "  - VM $vm: fsfreeze-thaw" "  - VM $vm: fsfreeze-thaw"
+      qm agent "$vm" fsfreeze-thaw >/dev/null 2>&1 || true
+    done
+    for vm in "${SUSPENDED_QM[@]:-}"; do
+      msg "  - VM $vm: resume" "  - VM $vm: resume"
+      qm resume "$vm" >/dev/null 2>&1 || true
+    done
+  fi
+  if has_cmd pct; then
+    for ct in "${RUN_CT[@]:-}"; do
+      msg "  - CT $ct: unfreeze" "  - CT $ct: unfreeze"
+      pct unfreeze "$ct" >/dev/null 2>&1 || true
+    done
+  fi
+}
+
+{
+  exec >> "$LOG_FILE" 2>&1
+  echo "=========================================="
+  echo "Backup Worker Start: $(date '+%Y-%m-%d %H:%M:%S')"
+  echo "=========================================="
+
+  set_status "BACKUP: Initialisiere..."
+  msg "=== $(date) | Starte Panzer-Backup von $DISK -> $FINAL_FILE" \
+      "=== $(date) | Starting panzer-backup from $DISK -> $FINAL_FILE"
+
+  pve_quiesce_start
+  
+  set_status "BACKUP: Erstelle Partitionstabelle..."
+  sfdisk -d "$DISK" > "${BACKUP_DIR}/${IMG_PREFIX}.sfdisk"
+
+  set_status "BACKUP: Kopiere Disk-Image..."
+  set -o pipefail
+  
+  if [[ "$USE_COMPRESS" == "true" && "$ENCRYPT_MODE" == "gpg" ]]; then
+    msg "[*] dd | zstd | gpg | tee | sha256sum …" "[*] dd | zstd | gpg | tee | sha256sum …"
+    set_status "BACKUP: dd | zstd | gpg läuft..."
+    run_inhibited "Panzerbackup läuft / Panzerbackup running" bash -c '
+      dd if='"$DISK"' bs=64M status=progress \
+      | zstd -T0 -'"$ZSTD_LEVEL"' -q \
+      | gpg --batch --yes --symmetric --cipher-algo AES256 --pinentry-mode loopback --passphrase-fd 3 3<<<"'"$ENCRYPT_PASSPHRASE"'" \
+      | tee "'"$TEMP_FILE"'" \
+      | sha256sum -b \
+      | awk '"'"'{print $1"  '"$(basename "$FINAL_FILE")"'"}'"'"' > "'"$TEMP_SHA"'"
+    '
+  elif [[ "$USE_COMPRESS" == "true" ]]; then
+    msg "[*] dd | zstd | tee | sha256sum …" "[*] dd | zstd | tee | sha256sum …"
+    set_status "BACKUP: dd | zstd läuft..."
+    run_inhibited "Panzerbackup läuft / Panzerbackup running" bash -c '
+      dd if='"$DISK"' bs=64M status=progress \
+      | zstd -T0 -'"$ZSTD_LEVEL"' -q \
+      | tee "'"$TEMP_FILE"'" \
+      | sha256sum -b \
+      | awk '"'"'{print $1"  '"$(basename "$FINAL_FILE")"'"}'"'"' > "'"$TEMP_SHA"'"
+    '
+  elif [[ "$ENCRYPT_MODE" == "gpg" ]]; then
+    msg "[*] dd | gpg | tee | sha256sum …" "[*] dd | gpg | tee | sha256sum …"
+    set_status "BACKUP: dd | gpg läuft..."
+    run_inhibited "Panzerbackup läuft / Panzerbackup running" bash -c '
+      dd if='"$DISK"' bs=64M status=progress \
+      | gpg --batch --yes --symmetric --cipher-algo AES256 --pinentry-mode loopback --passphrase-fd 3 3<<<"'"$ENCRYPT_PASSPHRASE"'" \
+      | tee "'"$TEMP_FILE"'" \
+      | sha256sum -b \
+      | awk '"'"'{print $1"  '"$(basename "$FINAL_FILE")"'"}'"'"' > "'"$TEMP_SHA"'"
+    '
+  else
+    msg "[*] dd (roh) | tee | sha256sum …" "[*] dd (raw) | tee | sha256sum …"
+    set_status "BACKUP: dd (raw) läuft..."
+    run_inhibited "Panzerbackup läuft / Panzerbackup running" bash -c '
+      dd if='"$DISK"' bs=64M status=progress \
+      | tee "'"$TEMP_FILE"'" \
+      | sha256sum -b \
+      | awk '"'"'{print $1"  '"$(basename "$FINAL_FILE")"'"}'"'"' > "'"$TEMP_SHA"'"
+    '
+  fi
+  set +o pipefail
+
+  set_status "BACKUP: Finalisiere..."
+  sync
+  mv -f "$TEMP_FILE" "$FINAL_FILE"
+  mv -f "$TEMP_SHA" "${FINAL_FILE}.sha256"
+
+  msg "[✓] Datei: $(du -h "$FINAL_FILE" | cut -f1)   Hash: $(cut -d' ' -f1 "${FINAL_FILE}.sha256")" \
+      "[✓] File:  $(du -h "$FINAL_FILE" | cut -f1)   Hash: $(cut -d' ' -f1 "${FINAL_FILE}.sha256")"
+
+  ln -sfn "$(basename "$FINAL_FILE")" "${BACKUP_DIR}/LATEST_OK"
+  ln -sfn "$(basename "$FINAL_FILE").sha256" "${BACKUP_DIR}/LATEST_OK.sha256"
+  ln -sfn "${IMG_PREFIX}.sfdisk" "${BACKUP_DIR}/LATEST_OK.sfdisk"
+
+  set_status "BACKUP: Räume alte Backups auf..."
+  mapfile -t ALL < <(ls -1t \
+    "$BACKUP_DIR"/panzer_*.img "$BACKUP_DIR"/panzer_*.img.zst \
+    "$BACKUP_DIR"/panzer_*.img.gpg "$BACKUP_DIR"/panzer_*.img.zst.gpg 2>/dev/null || true)
+  if (( ${#ALL[@]} > KEEP )); then
+    for old in "${ALL[@]:$KEEP}"; do
+      msg "  - Entferne alt: $old" "  - Removing old: $old"
+      rm -f "$old" "${old}.sha256" "${old%.img*}.sfdisk" 2>/dev/null || true
+    done
+  fi
+  
+  set_status "BACKUP: Abgeschlossen - $(basename "$FINAL_FILE")"
+  msg "=== $(date) | Backup erfolgreich abgeschlossen ===" "=== $(date) | Backup completed successfully ==="
+  
+  echo "=========================================="
+  echo "Backup Worker Ende: $(date '+%Y-%m-%d %H:%M:%S')"
+  echo "=========================================="
+  rm -f "$PID_FILE"
+}
+EOFWORKER
+
+  chmod +x /tmp/panzerbackup-worker.sh
+  
+  # Temporäres Startup-Log für Debugging
+  local startup_log="/tmp/panzerbackup-startup.log"
+  : > "$startup_log"
+  
+  # Worker im Hintergrund starten (explizite, minimale Umgebung)
+  env -i \
+    PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    HOME="/root" \
+    LC_ALL="C" LANG="C" \
+    LANG_CHOICE="$LANG_CHOICE" \
+    DISK="$DISK" BACKUP_DIR="$BACKUP_DIR" IMG_PREFIX="$IMG_PREFIX" \
+    FINAL_FILE="$FINAL_FILE" TEMP_FILE="$TEMP_FILE" TEMP_SHA="$TEMP_SHA" \
+    USE_COMPRESS="$USE_COMPRESS" ENCRYPT_MODE="$ENCRYPT_MODE" \
+    ENCRYPT_PASSPHRASE="$ENCRYPT_PASSPHRASE" ZSTD_LEVEL="$ZSTD_LEVEL" \
+    STATUS_FILE="$STATUS_FILE" PID_FILE="$PID_FILE" \
+    LOG_FILE="$LOG_FILE_DEFAULT" KEEP="$KEEP" \
+    nohup setsid /tmp/panzerbackup-worker.sh >> "$startup_log" 2>&1 &
+
+  local worker_pid=$!
+  echo $worker_pid > "$PID_FILE"
+  
+  # Kurz warten und prüfen ob Worker noch läuft
+  sleep 2
+  if ! ps -p $worker_pid >/dev/null 2>&1; then
+    set_status "FEHLER: Worker-Start fehlgeschlagen – siehe $startup_log"
+    msg "⚠️  WARNUNG: Worker-Prozess beendet sich sofort!" \
+        "⚠️  WARNING: Worker process terminated immediately!"
+    msg "   Prüfe: cat $startup_log" \
+        "   Check: cat $startup_log"
+    msg "   oder: tail $LOG_FILE_DEFAULT" \
+        "   or: tail $LOG_FILE_DEFAULT"
+  fi
+}
+
+# =====================[ Backup (Starter) ]====================================
 do_backup() {
+  if is_running; then
+    msg "Ein Backup läuft bereits!" "A backup is already running!"
+    msg "Aktueller Status: $(get_status)" "Current status: $(get_status)"
+    return 1
+  fi
+  
   need_cmd dd; need_cmd sha256sum; need_cmd sfdisk
   ensure_zstd_if_needed "$COMPRESS_MODE"
 
@@ -441,78 +702,53 @@ do_backup() {
   
   msg "→ Backup-Name: $backup_name" "→ Backup name: $backup_name"
 
-  local use_compress="false"
-  if [[ "$COMPRESS_MODE" == "on" ]]; then use_compress="true"
-  elif [[ "$COMPRESS_MODE" == "auto" && $(has_cmd zstd && echo yes || echo no) == "yes" ]]; then use_compress="true"
+  USE_COMPRESS="false"
+  if [[ "$COMPRESS_MODE" == "on" ]]; then USE_COMPRESS="true"
+  elif [[ "$COMPRESS_MODE" == "auto" && $(has_cmd zstd && echo yes || echo no) == "yes" ]]; then USE_COMPRESS="true"
   fi
 
-  local final_file="${BACKUP_DIR}/${IMG_PREFIX}.img"
-  [[ "$use_compress" == "true" ]] && final_file="${final_file}.zst"
-  [[ "$ENCRYPT_MODE" == "gpg" ]] && final_file="${final_file}.gpg"
-  local temp_file="${final_file}.part"
-  local temp_sha="${final_file}.sha256.part"
+  FINAL_FILE="${BACKUP_DIR}/${IMG_PREFIX}.img"
+  [[ "$USE_COMPRESS" == "true" ]] && FINAL_FILE="${FINAL_FILE}.zst"
+  [[ "$ENCRYPT_MODE" == "gpg" ]] && FINAL_FILE="${FINAL_FILE}.gpg"
+  TEMP_FILE="${FINAL_FILE}.part"
+  TEMP_SHA="${FINAL_FILE}.sha256.part"
 
-  msg "=== $(date) | Starte Panzer-Backup von $DISK -> $final_file" \
-      "=== $(date) | Starting panzer-backup from $DISK -> $final_file" | tee -a "$BACKUP_DIR/panzerbackup.log"
-
-  pve_quiesce_start
-  sfdisk -d "$DISK" > "${BACKUP_DIR}/${IMG_PREFIX}.sfdisk"
-
-  set -o pipefail
-  if [[ "$use_compress" == "true" && "$ENCRYPT_MODE" == "gpg" ]]; then
-    msg "[*] dd | zstd | gpg | tee | sha256sum …" "[*] dd | zstd | gpg | tee | sha256sum …"
-    run_inhibited "Panzerbackup läuft / Panzerbackup running" bash -c '
-      dd if='"$DISK"' bs=64M status=progress 2>/dev/null \
-      | zstd -T0 -'"$ZSTD_LEVEL"' -q \
-      | gpg --batch --yes --symmetric --cipher-algo AES256 --pinentry-mode loopback --passphrase-fd 3 3<<<"'"$ENCRYPT_PASSPHRASE"'" \
-      | tee "'"$temp_file"'" \
-      | sha256sum -b \
-      | awk '"'"'{print $1"  '"$(basename "$final_file")"'"}'"'"' > "'"$temp_sha"'"
-    '
-  elif [[ "$use_compress" == "true" ]]; then
-    msg "[*] dd | zstd | tee | sha256sum …" "[*] dd | zstd | tee | sha256sum …"
-    run_inhibited "Panzerbackup läuft / Panzerbackup running" bash -c '
-      dd if='"$DISK"' bs=64M status=progress 2>/dev/null \
-      | zstd -T0 -'"$ZSTD_LEVEL"' -q \
-      | tee "'"$temp_file"'" \
-      | sha256sum -b \
-      | awk '"'"'{print $1"  '"$(basename "$final_file")"'"}'"'"' > "'"$temp_sha"'"
-    '
-  elif [[ "$ENCRYPT_MODE" == "gpg" ]]; then
-    msg "[*] dd | gpg | tee | sha256sum …" "[*] dd | gpg | tee | sha256sum …"
-    run_inhibited "Panzerbackup läuft / Panzerbackup running" bash -c '
-      dd if='"$DISK"' bs=64M status=progress 2>/dev/null \
-      | gpg --batch --yes --symmetric --cipher-algo AES256 --pinentry-mode loopback --passphrase-fd 3 3<<<"'"$ENCRYPT_PASSPHRASE"'" \
-      | tee "'"$temp_file"'" \
-      | sha256sum -b \
-      | awk '"'"'{print $1"  '"$(basename "$final_file")"'"}'"'"' > "'"$temp_sha"'"
-    '
+  clear_status
+  msg "" ""
+  msg "Starte Backup im Hintergrund..." "Starting backup in background..."
+  
+  # Debug-Info
+  msg "[Debug] Worker wird gestartet mit:" "[Debug] Starting worker with:"
+  msg "  - Disk: $DISK" "  - Disk: $DISK"
+  msg "  - Ziel: $FINAL_FILE" "  - Target: $FINAL_FILE"
+  msg "  - Kompression: $USE_COMPRESS" "  - Compression: $USE_COMPRESS"
+  msg "  - Verschlüsselung: $ENCRYPT_MODE" "  - Encryption: $ENCRYPT_MODE"
+  
+  do_backup_background
+  
+  # Prüfe ob Worker läuft
+  sleep 2
+  if is_running; then
+    echo ""
+    msg "✓ Backup läuft!" "✓ Backup is running!"
+    msg "  Verwende './$(basename "$0") status' um den Fortschritt zu sehen." \
+        "  Use './$(basename "$0") status' to watch progress."
+    msg "  Aktueller Status: $(get_status)" "  Current status: $(get_status)"
   else
-    msg "[*] dd (roh) | tee | sha256sum …" "[*] dd (raw) | tee | sha256sum …"
-    run_inhibited "Panzerbackup läuft / Panzerbackup running" bash -c '
-      dd if='"$DISK"' bs=64M status=progress 2>/dev/null \
-      | tee "'"$temp_file"'" \
-      | sha256sum -b \
-      | awk '"'"'{print $1"  '"$(basename "$final_file")"'"}'"'"' > "'"$temp_sha"'"
-    '
+    echo ""
+    msg "⚠️  WARNUNG: Worker wurde beendet oder konnte nicht starten!" \
+        "⚠️  WARNING: Worker terminated or could not start!"
+    msg "  Prüfe Logs:" "  Check logs:"
+    msg "    cat /tmp/panzerbackup-startup.log" "    cat /tmp/panzerbackup-startup.log"
+    msg "    tail ${LOG_FILE_DEFAULT}" "    tail ${LOG_FILE_DEFAULT}"
+    [[ -f "/tmp/panzerbackup-startup.log" ]] && {
+      echo ""
+      msg "=== Startup-Log ===" "=== Startup log ==="
+      cat /tmp/panzerbackup-startup.log || true
+    }
   fi
-  set +o pipefail
-
-  sync
-  mv -f "$temp_file" "$final_file"
-  mv -f "$temp_sha"  "${final_file}.sha256"
-
-  msg "[✓] Datei: $(du -h "$final_file" | cut -f1)   Hash: $(cut -d' ' -f1 "${final_file}.sha256")" \
-      "[✓] File:  $(du -h "$final_file" | cut -f1)   Hash: $(cut -d' ' -f1 "${final_file}.sha256")"
-
-  ln -sfn "$(basename "$final_file")"        "${BACKUP_DIR}/LATEST_OK"
-  ln -sfn "$(basename "$final_file").sha256" "${BACKUP_DIR}/LATEST_OK.sha256"
-  ln -sfn "${IMG_PREFIX}.sfdisk"             "${BACKUP_DIR}/LATEST_OK.sfdisk"
-
-  rotate_old "$BACKUP_DIR" "$KEEP"
-  msg "=== $(date) | Backup erfolgreich abgeschlossen ===" "=== $(date) | Backup completed successfully ==="
-  post_action_maybe "backup"
-
+  echo ""
+  
   ENCRYPT_PASSPHRASE=""
 }
 
@@ -643,6 +879,110 @@ post_action_maybe() {
   esac
 }
 
+# =====================[ Systemd Summary (optional) ]=========================
+systemd_summary() {
+  command -v systemctl >/dev/null 2>&1 || return 0
+  echo "------------------------------------------"
+  msg "Systemd-Übersicht:" "Systemd summary:"
+  local svc="panzerbackup.service" tim="panzerbackup.timer"
+  local svc_state tim_state tim_enabled
+  svc_state="$(systemctl is-active "$svc" 2>/dev/null || echo unknown)"
+  tim_state="$(systemctl is-active "$tim" 2>/dev/null || echo unknown)"
+  tim_enabled="$(systemctl is-enabled "$tim" 2>/dev/null || echo unknown)"
+  msg "  Service: ${svc} → ${svc_state}" "  Service: ${svc} → ${svc_state}"
+  msg "  Timer:   ${tim} → ${tim_state} / ${tim_enabled}" "  Timer:   ${tim} → ${tim_state} / ${tim_enabled}"
+  local timers_line
+  timers_line="$(systemctl list-timers --all | awk '/panzerbackup\.timer/ {print}' || true)"
+  if [[ -n "$timers_line" ]]; then
+    # Columns: NEXT LEFT LAST PASSED UNIT ACTIVATES
+    awk -v L="$LANG_CHOICE" '
+      /panzerbackup\.timer/ {
+        next_time=$1 " " $2; last_time=$4 " " $5;
+        if (L=="de") {
+          printf("  Nächster Lauf: %s | Letzter Lauf: %s\n", next_time, last_time);
+        } else {
+          printf("  Next run: %s | Last run: %s\n", next_time, last_time);
+        }
+      }
+    ' <<<"$timers_line"
+  fi
+}
+
+# =====================[ Live Status anzeigen (wie BorgBase) ]================
+show_status() {
+  { clear 2>/dev/null || printf '\033c'; } || true
+  echo "=========================================="
+  msg "    Panzerbackup - Live-Status" "    Panzerbackup - Live Status"
+  echo "=========================================="
+  echo ""
+
+  if ! is_running; then
+    msg "Kein Backup läuft aktuell." "No backup is currently running."
+    echo ""
+    [[ -f "$STATUS_FILE" ]] && msg "Letzter Status: $(cat "$STATUS_FILE")" "Last status: $(cat "$STATUS_FILE")"
+    echo ""
+    systemd_summary
+    echo ""
+    if [[ "$LANG_CHOICE" == "de" ]]; then 
+      read -rp "Drücke Enter um zurückzukehren..." _ || true
+    else 
+      read -rp "Press Enter to return..." _ || true
+    fi
+    return 0
+  fi
+
+  if [[ "$LANG_CHOICE" == "de" ]]; then 
+    echo "STRG+C zum Beenden der Anzeige (Backup läuft weiter!)"
+  else 
+    echo "CTRL+C to stop viewing (backup keeps running!)"
+  fi
+  echo ""
+
+  cleanup() { trap - INT TERM; }
+  trap cleanup INT TERM
+
+  while is_running; do
+    { clear 2>/dev/null || printf '\033c'; } || true
+    echo "=========================================="
+    msg "    Panzerbackup - Live-Status" "    Panzerbackup - Live Status"
+    echo "=========================================="
+    echo ""
+    if [[ "$LANG_CHOICE" == "de" ]]; then 
+      echo "STRG+C zum Beenden der Anzeige (Backup läuft weiter!)"
+    else 
+      echo "CTRL+C to stop viewing (backup keeps running!)"
+    fi
+    echo ""
+    msg "Aktueller Status: $(get_status)" "Current status: $(get_status)"
+    echo "=========================================="
+    msg "Log (letzte 50 Zeilen):" "Log (last 50 lines):"
+    echo "=========================================="
+
+    local logfile="${LOG_FILE_DEFAULT}"
+    if [[ -f "$logfile" ]]; then
+      tail -n 50 "$logfile" 2>/dev/null || msg "(Log noch nicht verfügbar)" "(Log not yet available)"
+    else
+      msg "(Kein Log vorhanden)" "(No log present)"
+    fi
+
+    sleep 2
+  done
+
+  echo ""
+  echo "=========================================="
+  msg "Backup abgeschlossen!" "Backup finished!"
+  msg "Finaler Status: $(get_status)" "Final status: $(get_status)"
+  echo "=========================================="
+  echo ""
+  systemd_summary
+  echo ""
+  if [[ "$LANG_CHOICE" == "de" ]]; then 
+    read -rp "Drücke Enter um zurückzukehren..." _ || true
+  else 
+    read -rp "Press Enter to return..." _ || true
+  fi
+}
+
 # =====================[ Usage / Hilfe ]======================================
 print_usage() {
   if [[ "$LANG_CHOICE" == "de" ]]; then
@@ -655,18 +995,22 @@ Aufruf:
   $0 backup  [--name NAME] [--compress|--no-compress] [--zstd-level N] [--encrypt|--no-encrypt] [--passfile FILE] [--post reboot|shutdown|none] [--select-backup] [--disk /dev/XYZ]
   $0 restore [--dry-run] [--select-disk] [--target /dev/sdX] [--post reboot|shutdown|none] [--passfile FILE] [--select-backup] [--disk /dev/XYZ]
   $0 verify
-  $0                                     # interaktives Menü
+  $0 status  # Live-Status + systemd-Zusammenfassung
+  $0         # interaktives Menü
 
 Hinweise:
 - --name NAME: Benutzerdefinierter Backup-Name (z.B. 'proxmox-host1'). Standard: Hostname
 - Proxmox-VMs: QGA → fsfreeze; sonst suspend. CTs: freeze.
 - Backup-Ziel: Label case-insensitive **Teilstring** (z.B. "PANZERBACKUP" matcht "panzerbackup-pm").
 - Dateien: panzer_NAME_DATUM.img[.zst][.gpg] + .sha256; LATEST_OK Symlink + .sfdisk.
+- Status-Tracking: Während eines Backups mit '$0 status' den Fortschritt verfolgen.
+- Systemd: Falls eingerichtet, zeigt 'status' auch Timer/Service-Infos.
 
 Beispiele:
   $0 backup --name pve-node1 --compress --encrypt
   $0 backup --name homeserver --no-encrypt --post shutdown
   BACKUP_NAME=proxmox1 $0 backup --compress
+  $0 status
 USAGE
   else
 cat <<USAGE
@@ -678,18 +1022,21 @@ Usage:
   $0 backup  [--name NAME] [--compress|--no-compress] [--zstd-level N] [--encrypt|--no-encrypt] [--passfile FILE] [--post reboot|shutdown|none] [--select-backup] [--disk /dev/XYZ]
   $0 restore [--dry-run] [--select-disk] [--target /dev/sdX] [--post reboot|shutdown|none] [--passfile FILE] [--select-backup] [--disk /dev/XYZ]
   $0 verify
-  $0                                     # interactive menu
+  $0 status  # Live status + systemd summary
+  $0         # interactive menu
 
 Notes:
 - --name NAME: Custom backup name (e.g., 'proxmox-host1'). Default: hostname
 - Proxmox VMs: QGA → fsfreeze; otherwise suspend. CTs: freeze.
 - Backup target: label case-insensitive **substring** (e.g., "PANZERBACKUP" matches "panzerbackup-pm").
 - Files: panzer_NAME_DATE.img[.zst][.gpg] + .sha256; LATEST_OK symlink + .sfdisk.
+- Status tracking: Use '$0 status' during a run; also shows systemd summary if units exist.
 
 Examples:
   $0 backup --name pve-node1 --compress --encrypt
   $0 backup --name homeserver --no-encrypt --post shutdown
   BACKUP_NAME=proxmox1 $0 backup --compress
+  $0 status
 USAGE
   fi
 }
@@ -701,7 +1048,7 @@ if [[ $# -gt 0 ]]; then
       shift; REMAINS=($(parse_backup_flags "$@"))
       if [[ -t 0 && -t 1 ]]; then
         [[ -z "${POST_ACTION_PRESET:-}" ]] && prompt_post_action "Backup"
-        if [[ "${ENCRYPT_MODE}" == "off" && -z "${ENCRYPT_PASSPHRASE}" ]]; then prompt_encryption; fi
+        if [[ "${ENCRYPT_MODE}" == "off" && -z "${ENCRYPT_PASSPHRASE:-}" ]]; then prompt_encryption; fi
       fi
       do_backup ;;
     restore)
@@ -712,6 +1059,10 @@ if [[ $# -gt 0 ]]; then
       do_restore ;;
     verify)
       do_verify ;;
+    status)
+      show_status ;;
+    help|--help|-h)
+      print_usage; exit 0 ;;
     *)
       print_usage; exit 1 ;;
   esac
@@ -726,7 +1077,8 @@ else
     echo "5) Backup mit Kompression (zstd)"
     echo "6) Restore mit Disk-Auswahl"
     echo "7) Verify letztes Backup"
-    read -rp "Auswahl (1/2/3/4/5/6/7): " choice
+    echo "8) Status anzeigen (Live-Fortschritt)"
+    read -rp "Auswahl (1-8): " choice
   else
     echo "System disk: $DISK"
     echo "Backup dir:  $BACKUP_DIR"
@@ -737,7 +1089,8 @@ else
     echo "5) Backup with compression (zstd)"
     echo "6) Restore with disk selection"
     echo "7) Verify latest backup"
-    read -rp "Choice (1/2/3/4/5/6/7): " choice
+    echo "8) Show status (live progress)"
+    read -rp "Choice (1-8): " choice
   fi
   case "$choice" in
     1) COMPRESS_MODE="auto";  
@@ -765,6 +1118,7 @@ else
        prompt_post_action "Backup";  prompt_encryption; do_backup ;;
     6) SELECT_DISK="true";    prompt_post_action "Restore"; do_restore ;;
     7) do_verify ;;
+    8) show_status ;;
     *) if [[ "$LANG_CHOICE" == "de" ]]; then echo "Ungültige Auswahl"; else echo "Invalid selection"; fi; exit 1 ;;
   esac
 fi
