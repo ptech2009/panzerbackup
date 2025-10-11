@@ -30,6 +30,18 @@ All menus and messages are shown in the chosen language.
 * Makes managing backups from multiple systems easy
 * Files named as: `panzer_NAME_2025-10-04_21-03-29.img.zst.gpg`
 
+### ✅ **Background Execution with Live Status** 🆕
+* Backups run in background and survive SSH disconnections
+* Real-time status monitoring via `./panzerbackup.sh status`
+* Live progress display with automatic log updates
+* Worker process continues even if your terminal closes
+
+### ✅ **Systemd Integration** 🆕
+* Native systemd service and timer support
+* Automated scheduled backups (recommended for production)
+* Integrated status display shows timer/service information
+* Perfect for unattended nightly backups with auto-reboot
+
 ### ✅ **Compression**
 * Uses `zstd` with multi-threading for fast and efficient backups
 * Falls back to raw image if `zstd` is not available
@@ -100,6 +112,7 @@ When launched without arguments, the script shows a full interactive menu:
 5) Backup with compression (zstd)
 6) Restore with disk selection
 7) Verify latest backup
+8) Show status (live progress)
 ```
 
 During backup, you will be prompted for:
@@ -129,6 +142,20 @@ sudo ./panzerbackup.sh backup --name homeserver --compress --passfile /root/.bac
 
 # Set name via environment variable
 BACKUP_NAME=prod-server sudo ./panzerbackup.sh backup --compress
+
+# Start backup and monitor progress
+sudo ./panzerbackup.sh backup --name server1 --compress
+sudo ./panzerbackup.sh status  # Watch live progress
+```
+
+### Status Monitoring
+
+```bash
+# Watch live backup progress (updates every 2 seconds)
+sudo ./panzerbackup.sh status
+
+# Check if backup is running
+# Shows current status, logs, and systemd information
 ```
 
 ### Restore Examples
@@ -172,6 +199,106 @@ sudo ./panzerbackup.sh verify
 - `--select-disk` - Show disk selection menu
 - `--post reboot|shutdown|none` - Action after restore
 - `--passfile FILE` - Read decryption passphrase from file
+
+---
+
+## ⚙️ Systemd Integration (Recommended for Production)
+
+For scheduled, robust nightly backups (especially with reboots, network dependencies, or boot order requirements), systemd is the cleanest solution.
+
+### A) Create Systemd Service
+
+```bash
+# Create/replace service unit
+sudo tee /etc/systemd/system/panzerbackup.service >/dev/null <<'EOF'
+[Unit]
+Description=Panzerbackup – Automated System Backup
+After=network-online.target local-fs.target
+Wants=network-online.target
+# Ensure backup target is mounted (adjust path if needed)
+RequiresMountsFor=/mnt/panzerbackup-pm
+# Only start if script exists and is executable
+ConditionPathIsExecutable=/root/bin/panzerbackup.sh
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+# Optional: separate env file for settings (BACKUP_LABEL, KEEP, etc.)
+EnvironmentFile=-/etc/panzerbackup.env
+# Provide clean PATH (including /root/bin)
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/bin
+# Optional: Set language to avoid prompts (script is non-interactive under systemd anyway)
+# Environment=LANG_CHOICE=en
+WorkingDirectory=/root/bin
+ExecStart=/root/bin/panzerbackup.sh backup --post none
+PrivateTmp=yes
+NoNewPrivileges=yes
+TimeoutStartSec=12h
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Reload and enable
+sudo systemctl daemon-reload
+sudo systemctl enable panzerbackup.service
+
+# Test run manually
+sudo systemctl start panzerbackup.service
+
+# Check status/logs
+systemctl status panzerbackup.service
+journalctl -u panzerbackup.service -n 100 --no-pager
+```
+
+### B) Create Systemd Timer (Daily at 02:30 ± 30 min)
+
+```bash
+sudo tee /etc/systemd/system/panzerbackup.timer >/dev/null <<'EOF'
+[Unit]
+Description=Panzerbackup – Daily Backup Schedule
+Requires=panzerbackup.service
+
+[Timer]
+OnCalendar=*-*-* 02:30:00
+RandomizedDelaySec=30m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now panzerbackup.timer
+```
+
+### Check Timer Status
+
+```bash
+# View next/last run times
+systemctl list-timers panzerbackup.timer
+
+# Check last service execution
+systemctl status panzerbackup.service
+journalctl -u panzerbackup.service -n 100 --no-pager
+```
+
+### Live Status Monitoring
+
+Even when systemd starts the job, you can always monitor progress:
+
+```bash
+sudo ./panzerbackup.sh status
+```
+
+**Important:** Detailed progress remains in the dedicated log `/mnt/panzerbackup-pm/panzerbackup.log` and status tracking `/tmp/panzerbackup-status`.
+
+The `status` command shows:
+- Current backup status
+- Live log output (last 50 lines)
+- Systemd timer/service information (if configured)
+- Process information
 
 ---
 
@@ -242,6 +369,21 @@ ZSTD_LEVEL=9 ./panzerbackup.sh backup --compress
 
 # Override disk detection
 DISK_OVERRIDE=/dev/sdb ./panzerbackup.sh backup
+
+# Set language without prompt
+LANG_CHOICE=en ./panzerbackup.sh
+```
+
+### Environment File for Systemd
+
+Create `/etc/panzerbackup.env`:
+
+```bash
+BACKUP_LABEL=panzerbackup-pm
+KEEP=5
+BACKUP_NAME=proxmox-main
+ZSTD_LEVEL=6
+LANG_CHOICE=en
 ```
 
 ---
@@ -265,7 +407,14 @@ sudo ./panzerbackup.sh backup --name db-server --compress
 # All backups stored on same external drive, easily distinguishable
 ```
 
-### Automated Backups (Cronjob)
+### Automated Backups (Systemd Timer - Recommended)
+```bash
+# Set up systemd service + timer as shown above
+# Configure via /etc/panzerbackup.env
+# Monitor with: sudo ./panzerbackup.sh status
+```
+
+### Automated Backups (Legacy Cronjob)
 ```bash
 # /etc/cron.monthly/panzerbackup
 #!/bin/bash
@@ -280,6 +429,17 @@ BACKUP_NAME=prod-$(hostname -s) /path/to/panzerbackup.sh backup \
 ```bash
 # Boot from live USB, mount backup drive, restore
 sudo ./panzerbackup.sh restore --select-disk
+```
+
+### Monitoring Running Backups
+```bash
+# Start backup in background
+sudo ./panzerbackup.sh backup --name production --compress
+
+# Monitor progress from another terminal (or after SSH reconnect)
+sudo ./panzerbackup.sh status
+
+# Exit monitoring with CTRL+C (backup continues!)
 ```
 
 ---
@@ -306,15 +466,32 @@ Every bit of feedback helps make Panzerbackup even more robust.
 * Can restore to new hardware without hassle
 * Backups stay running even if your SSH session is interrupted
 * Named backups make managing multiple systems easy
+* **Live status monitoring** shows real-time progress and logs
+* **Systemd integration** enables professional scheduled backups
 
 ---
 
 ## 🆕 What's New in This Version
 
 - **Named Backups**: Assign custom names to distinguish backups from different systems
-- **Improved Menu**: Backup name prompt integrated into interactive workflow
-- **Better CLI**: `--name` flag for automation
-- **Enhanced Documentation**: Complete examples and use cases
+- **Background Execution**: Backups run in background and survive SSH disconnections
+- **Live Status Monitoring**: Real-time progress tracking with `./panzerbackup.sh status`
+- **Systemd Integration**: Native service and timer support for automated scheduling
+- **Enhanced Status Display**: Shows running backups, logs, and systemd information
+- **Improved Robustness**: Worker process isolation and error handling
+- **Better CLI**: `--name` flag for automation and environment variable support
+- **Production-Ready**: Perfect for unattended operations with automatic recovery
+
+---
+
+## 🔄 Migration from Previous Versions
+
+If you're upgrading from an older version:
+
+1. **No breaking changes** - all existing backups remain compatible
+2. **New status command** - use `./panzerbackup.sh status` to monitor backups
+3. **Optional systemd setup** - recommended for scheduled backups (see above)
+4. **Named backups** - now prompted during interactive backup or via `--name` flag
 
 ---
 
