@@ -43,8 +43,13 @@ need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Benötigtes Kommando fehlt:
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 # =====================[ Status-Tracking (wie BorgBase Manager) ]==============
-STATUS_FILE="${STATUS_FILE:-/tmp/panzerbackup-status}"
-PID_FILE="${PID_FILE:-/tmp/panzerbackup.pid}"
+RUN_DIR="${RUN_DIR:-/run/panzerbackup}"
+mkdir -p "$RUN_DIR"
+STATUS_FILE="${STATUS_FILE:-$RUN_DIR/status}"
+PID_FILE="${PID_FILE:-$RUN_DIR/pid}"
+STARTUP_LOG="${STARTUP_LOG:-$RUN_DIR/startup.log}"
+WORKER_SCRIPT="${WORKER_SCRIPT:-$RUN_DIR/worker.sh}"
+
 
 set_status() { echo "$1" > "$STATUS_FILE"; }
 get_status() { 
@@ -436,6 +441,22 @@ prompt_encryption() {
 parse_backup_flags() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
+    resume-orphans)
+      resume_orphans
+      exit 0 ;;
+    stop)
+      if is_running; then
+        pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+        msg "Sende SIGINT an PID $pid ..." "Sending SIGINT to PID $pid ..."
+        kill -INT "$pid" 2>/dev/null || true
+        sleep 2
+      fi
+      resume_orphans
+      clear_status
+      rm -f "$PID_FILE"
+      msg "Gestoppt." "Stopped."
+      exit 0 ;;
+
       --compress)      COMPRESS_MODE="on"; shift ;;
       --no-compress)   COMPRESS_MODE="off"; shift ;;
       --zstd-level)    ZSTD_LEVEL="${2:-6}"; shift 2 ;;
@@ -472,7 +493,7 @@ do_backup_background() {
   set_status "BACKUP: Wird gestartet..."
   
   # Worker-Skript erstellen
-  cat > /tmp/panzerbackup-worker.sh << 'EOFWORKER'
+  cat > "$WORKER_SCRIPT" << 'EOFWORKER'
 #!/usr/bin/env bash
 set -euo pipefail
 set -E
@@ -648,10 +669,10 @@ pve_quiesce_end() {
 }
 EOFWORKER
 
-  chmod +x /tmp/panzerbackup-worker.sh
+  chmod +x "$WORKER_SCRIPT"
   
   # Temporäres Startup-Log für Debugging
-  local startup_log="/tmp/panzerbackup-startup.log"
+  local startup_log=""$STARTUP_LOG""
   : > "$startup_log"
   
   # Worker im Hintergrund starten (explizite, minimale Umgebung)
@@ -666,7 +687,7 @@ EOFWORKER
     ENCRYPT_PASSPHRASE="$ENCRYPT_PASSPHRASE" ZSTD_LEVEL="$ZSTD_LEVEL" \
     STATUS_FILE="$STATUS_FILE" PID_FILE="$PID_FILE" \
     LOG_FILE="$LOG_FILE_DEFAULT" KEEP="$KEEP" \
-    nohup setsid /tmp/panzerbackup-worker.sh >> "$startup_log" 2>&1 &
+    nohup setsid bash "$WORKER_SCRIPT" >> "$STARTUP_LOG" 2>&1 &
 
   local worker_pid=$!
   echo $worker_pid > "$PID_FILE"
@@ -739,12 +760,12 @@ do_backup() {
     msg "⚠️  WARNUNG: Worker wurde beendet oder konnte nicht starten!" \
         "⚠️  WARNING: Worker terminated or could not start!"
     msg "  Prüfe Logs:" "  Check logs:"
-    msg "    cat /tmp/panzerbackup-startup.log" "    cat /tmp/panzerbackup-startup.log"
+    
     msg "    tail ${LOG_FILE_DEFAULT}" "    tail ${LOG_FILE_DEFAULT}"
-    [[ -f "/tmp/panzerbackup-startup.log" ]] && {
+    [[ -f ""$STARTUP_LOG"" ]] && {
       echo ""
       msg "=== Startup-Log ===" "=== Startup log ==="
-      cat /tmp/panzerbackup-startup.log || true
+      cat "$STARTUP_LOG" || true
     }
   fi
   echo ""
@@ -1038,6 +1059,31 @@ Examples:
   BACKUP_NAME=proxmox1 $0 backup --compress
   $0 status
 USAGE
+  fi
+}
+
+
+resume_orphans() {
+  # Resume paused QEMU VMs
+  if has_cmd qm; then
+    while read -r id; do
+      [[ -z "$id" ]] && continue
+      st="$(qm status "$id" 2>/dev/null | awk '{print $2}')"
+      if [[ "$st" == "paused" ]]; then
+        msg "  - qm resume $id" "  - qm resume $id"
+        qm resume "$id" >/dev/null 2>&1 || true
+      fi
+      # Try to thaw filesystems via QGA (harmless if unsupported)
+      qm agent "$id" fsfreeze-thaw >/dev/null 2>&1 || true
+    done < <(qm list 2>/dev/null | awk 'NR>1 {print $1}')
+  fi
+  # Unfreeze any LXC containers
+  if has_cmd pct; then
+    while read -r ct; do
+      [[ -z "$ct" ]] && continue
+      msg "  - pct unfreeze $ct" "  - pct unfreeze $ct"
+      pct unfreeze "$ct" >/dev/null 2>&1 || true
+    done < <(pct list 2>/dev/null | awk 'NR>1 {print $1}')
   fi
 }
 
