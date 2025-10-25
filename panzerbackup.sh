@@ -50,7 +50,6 @@ PID_FILE="${PID_FILE:-$RUN_DIR/pid}"
 STARTUP_LOG="${STARTUP_LOG:-$RUN_DIR/startup.log}"
 WORKER_SCRIPT="${WORKER_SCRIPT:-$RUN_DIR/worker.sh}"
 
-
 set_status() { echo "$1" > "$STATUS_FILE"; }
 get_status() { 
   [[ -s "$STATUS_FILE" ]] && cat "$STATUS_FILE" || {
@@ -373,7 +372,7 @@ DISK="${DISK_OVERRIDE:-$(detect_system_disk || true)}"
 [[ -b "${DISK:-}" ]] || die "Konnte Systemdisk nicht ermitteln" "Could not determine system disk"
 SELECT_BACKUP="${SELECT_BACKUP:-""}"
 BACKUP_DIR="$(detect_backup_dir "$BACKUP_LABEL" || true)"
-[[ -d "${BACKUP_DIR:-}" && -w "$BACKUP_DIR" ]] || die "Backup-Platte mit Label $BACKUP_LABEL nicht gefunden/ nicht schreibbar" "Backup drive with label $BACKUP_LABEL not found / not writable"
+[[ -d "${BACKUP_DIR:-}" && -w "${BACKUP_DIR:-}" ]] || die "Backup-Platte mit Label $BACKUP_LABEL nicht gefunden/ nicht schreibbar" "Backup drive with label $BACKUP_LABEL not found / not writable"
 
 KEEP="${KEEP:-3}"
 DATE="$(date +'%Y-%m-%d_%H-%M-%S')"
@@ -486,6 +485,17 @@ parse_restore_flags() {
     esac
   done
   printf '%s\0' "$@"
+}
+
+# =====================[ Log anzeigen ]=======================================
+do_log() {
+  local file="${1:-$LOG_FILE_DEFAULT}"
+  local lines="${2:-200}"
+  if [[ ! -f "$file" ]]; then
+    msg "(Kein Log vorhanden unter $file)" "(No log present at $file)"
+    return 1
+  fi
+  tail -n "$lines" "$file"
 }
 
 # =====================[ Backup Worker (Hintergrund) ]=======================
@@ -921,7 +931,6 @@ systemd_summary() {
   local timers_line
   timers_line="$(systemctl list-timers --all | awk '/panzerbackup\.timer/ {print}' || true)"
   if [[ -n "$timers_line" ]]; then
-    # Columns: NEXT LEFT LAST PASSED UNIT ACTIVATES
     awk -v L="$LANG_CHOICE" '
       /panzerbackup\.timer/ {
         next_time=$1 " " $2; last_time=$4 " " $5;
@@ -1022,7 +1031,10 @@ Aufruf:
   $0 backup  [--name NAME] [--compress|--no-compress] [--zstd-level N] [--encrypt|--no-encrypt] [--passfile FILE] [--post reboot|shutdown|none] [--select-backup] [--disk /dev/XYZ]
   $0 restore [--dry-run] [--select-disk] [--target /dev/sdX] [--post reboot|shutdown|none] [--passfile FILE] [--select-backup] [--disk /dev/XYZ]
   $0 verify
-  $0 status  # Live-Status + systemd-Zusammenfassung
+  $0 status
+  $0 log    [--lines N] [--file PATH]   # Logausgabe, Standard 200 Zeilen, default: \$BACKUP_DIR/panzerbackup.log
+  $0 stop                               # laufendes Backup via SIGINT stoppen
+  $0 exit                               # Skript beenden
   $0         # interaktives Menü
 
 Hinweise:
@@ -1031,13 +1043,10 @@ Hinweise:
 - Backup-Ziel: Label case-insensitive **Teilstring** (z.B. "PANZERBACKUP" matcht "panzerbackup-pm").
 - Dateien: panzer_NAME_DATUM.img[.zst][.gpg] + .sha256; LATEST_OK Symlink + .sfdisk.
 - Status-Tracking: Während eines Backups mit '$0 status' den Fortschritt verfolgen.
-- Systemd: Falls eingerichtet, zeigt 'status' auch Timer/Service-Infos.
 
 Beispiele:
-  $0 backup --name pve-node1 --compress --encrypt
-  $0 backup --name homeserver --no-encrypt --post shutdown
-  BACKUP_NAME=proxmox1 $0 backup --compress
-  $0 status
+  $0 log --lines 200
+  $0 log --file /mnt/panzerbackup-pm/panzerbackup.log --lines 200
 USAGE
   else
 cat <<USAGE
@@ -1049,25 +1058,20 @@ Usage:
   $0 backup  [--name NAME] [--compress|--no-compress] [--zstd-level N] [--encrypt|--no-encrypt] [--passfile FILE] [--post reboot|shutdown|none] [--select-backup] [--disk /dev/XYZ]
   $0 restore [--dry-run] [--select-disk] [--target /dev/sdX] [--post reboot|shutdown|none] [--passfile FILE] [--select-backup] [--disk /dev/XYZ]
   $0 verify
-  $0 status  # Live status + systemd summary
+  $0 status
+  $0 log    [--lines N] [--file PATH]   # show log, default 200 lines, default file: \$BACKUP_DIR/panzerbackup.log
+  $0 stop                               # stop running backup via SIGINT
+  $0 exit                               # exit script
   $0         # interactive menu
 
 Notes:
-- --name NAME: Custom backup name (e.g., 'proxmox-host1'). Default: hostname
 - Proxmox VMs: QGA → fsfreeze; otherwise suspend. CTs: freeze.
-- Backup target: label case-insensitive **substring** (e.g., "PANZERBACKUP" matches "panzerbackup-pm").
-- Files: panzer_NAME_DATE.img[.zst][.gpg] + .sha256; LATEST_OK symlink + .sfdisk.
-- Status tracking: Use '$0 status' during a run; also shows systemd summary if units exist.
-
 Examples:
-  $0 backup --name pve-node1 --compress --encrypt
-  $0 backup --name homeserver --no-encrypt --post shutdown
-  BACKUP_NAME=proxmox1 $0 backup --compress
-  $0 status
+  $0 log --lines 200
+  $0 log --file /mnt/panzerbackup-pm/panzerbackup.log --lines 200
 USAGE
   fi
 }
-
 
 resume_orphans() {
   # Resume paused QEMU VMs
@@ -1079,7 +1083,6 @@ resume_orphans() {
         msg "  - qm resume $id" "  - qm resume $id"
         qm resume "$id" >/dev/null 2>&1 || true
       fi
-      # Try to thaw filesystems via QGA (harmless if unsupported)
       qm agent "$id" fsfreeze-thaw >/dev/null 2>&1 || true
     done < <(qm list 2>/dev/null | awk 'NR>1 {print $1}')
   fi
@@ -1113,6 +1116,23 @@ if [[ $# -gt 0 ]]; then
       do_verify ;;
     status)
       show_status ;;
+    log)
+      shift
+      LOG_TAIL_LINES=200
+      LOG_FILE_PATH="$LOG_FILE_DEFAULT"
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          -n|--lines) LOG_TAIL_LINES="${2:-200}"; shift 2 ;;
+          -f|--file)  LOG_FILE_PATH="${2:-$LOG_FILE_DEFAULT}"; shift 2 ;;
+          *) break ;;
+        esac
+      done
+      do_log "$LOG_FILE_PATH" "$LOG_TAIL_LINES" ;;
+    stop)
+      # handled in parse_backup_flags but keep alias here
+      shift; REMAINS=($(parse_backup_flags stop "$@")) ;;
+    exit)
+      msg "Beende Skript." "Exiting script."; exit 0 ;;
     help|--help|-h)
       print_usage; exit 0 ;;
     *)
@@ -1130,7 +1150,9 @@ else
     echo "6) Restore mit Disk-Auswahl"
     echo "7) Verify letztes Backup"
     echo "8) Status anzeigen (Live-Fortschritt)"
-    read -rp "Auswahl (1-8): " choice
+    echo "9) Log anzeigen (200 Zeilen)"
+    echo "0) Beenden"
+    read -rp "Auswahl (0-9): " choice
   else
     echo "System disk: $DISK"
     echo "Backup dir:  $BACKUP_DIR"
@@ -1142,7 +1164,9 @@ else
     echo "6) Restore with disk selection"
     echo "7) Verify latest backup"
     echo "8) Show status (live progress)"
-    read -rp "Choice (1-8): " choice
+    echo "9) Show log (200 lines)"
+    echo "0) Exit"
+    read -rp "Choice (0-9): " choice
   fi
   case "$choice" in
     1) COMPRESS_MODE="auto";  
@@ -1171,6 +1195,8 @@ else
     6) SELECT_DISK="true";    prompt_post_action "Restore"; do_restore ;;
     7) do_verify ;;
     8) show_status ;;
+    9) do_log "$LOG_FILE_DEFAULT" "200" ;;
+    0) exit 0 ;;
     *) if [[ "$LANG_CHOICE" == "de" ]]; then echo "Ungültige Auswahl"; else echo "Invalid selection"; fi; exit 1 ;;
   esac
 fi
