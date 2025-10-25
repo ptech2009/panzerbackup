@@ -497,7 +497,7 @@ do_backup_background() {
 #!/usr/bin/env bash
 set -euo pipefail
 set -E
-trap 'rc=$?; echo "FEHLER (Backup Worker) in Zeile $LINENO: $BASH_COMMAND (RC=$rc)"; exit $rc' ERR
+trap 'rc=$?; set_status "FEHLER: Backup abgebrochen (RC=$rc)"; echo "FEHLER (Backup Worker) in Zeile $LINENO: $BASH_COMMAND (RC=$rc)"; exit $rc' ERR
 
 # Erwartete Variablen via env:
 # DISK BACKUP_DIR IMG_PREFIX FINAL_FILE TEMP_FILE TEMP_SHA USE_COMPRESS ENCRYPT_MODE ENCRYPT_PASSPHRASE ZSTD_LEVEL
@@ -644,9 +644,18 @@ pve_quiesce_end() {
   msg "[✓] Datei: $(du -h "$FINAL_FILE" | cut -f1)   Hash: $(cut -d' ' -f1 "${FINAL_FILE}.sha256")" \
       "[✓] File:  $(du -h "$FINAL_FILE" | cut -f1)   Hash: $(cut -d' ' -f1 "${FINAL_FILE}.sha256")"
 
-  ln -sfn "$(basename "$FINAL_FILE")" "${BACKUP_DIR}/LATEST_OK"
-  ln -sfn "$(basename "$FINAL_FILE").sha256" "${BACKUP_DIR}/LATEST_OK.sha256"
-  ln -sfn "${IMG_PREFIX}.sfdisk" "${BACKUP_DIR}/LATEST_OK.sfdisk"
+  # Verifiziere die geschriebene Datei – nur dann Erfolg melden
+  if ( cd "$BACKUP_DIR" && sha256sum -c "$(basename "$FINAL_FILE").sha256" >/dev/null 2>&1 ); then
+    ln -sfn "$(basename "$FINAL_FILE")"         "${BACKUP_DIR}/LATEST_OK"
+    ln -sfn "$(basename "$FINAL_FILE").sha256"  "${BACKUP_DIR}/LATEST_OK.sha256"
+    ln -sfn "${IMG_PREFIX}.sfdisk"              "${BACKUP_DIR}/LATEST_OK.sfdisk"
+    set_status "BACKUP: Erfolgreich abgeschlossen - $(basename "$FINAL_FILE")"
+    msg "✅ Backup erfolgreich abgeschlossen" "✅ Backup completed successfully"
+  else
+    set_status "FEHLER: Checksum-Verify fehlgeschlagen"
+    msg "❌ Backup fehlgeschlagen: Checksum-Verify" "❌ Backup failed: checksum verify"
+    exit 2
+  fi
 
   set_status "BACKUP: Räume alte Backups auf..."
   mapfile -t ALL < <(ls -1t \
@@ -658,9 +667,6 @@ pve_quiesce_end() {
       rm -f "$old" "${old}.sha256" "${old%.img*}.sfdisk" 2>/dev/null || true
     done
   fi
-  
-  set_status "BACKUP: Abgeschlossen - $(basename "$FINAL_FILE")"
-  msg "=== $(date) | Backup erfolgreich abgeschlossen ===" "=== $(date) | Backup completed successfully ==="
   
   echo "=========================================="
   echo "Backup Worker Ende: $(date '+%Y-%m-%d %H:%M:%S')"
