@@ -36,6 +36,18 @@ All menus and messages are shown in the chosen language.
 * Live progress display with automatic log updates
 * Worker process continues even if your terminal closes
 
+### ✅ **Advanced Status Display** 🆕
+* **Real-time progress monitoring** with automatic updates every 2 seconds
+* **Color-coded status indicators**:
+  - 🟢 Green: Successful completion
+  - 🟡 Yellow: Backup/restore in progress
+  - 🔴 Red: Errors or failures
+* **Live log streaming** showing the last 50 lines of backup activity
+* **Systemd integration display** showing timer and service status
+* **Process information** with PID tracking
+* **Persistent status tracking** survives terminal disconnection
+* Access via interactive menu option 8 (Progress) or `./panzerbackup.sh status`
+
 ### ✅ **Systemd Integration** 🆕
 * Native systemd service and timer support
 * Automated scheduled backups (recommended for production)
@@ -113,6 +125,8 @@ When launched without arguments, the script shows a full interactive menu:
 6) Restore with disk selection
 7) Verify latest backup
 8) Show status (live progress)
+9) View log file
+S) Stop running job
 ```
 
 During backup, you will be prompted for:
@@ -121,6 +135,67 @@ During backup, you will be prompted for:
 - **Encryption** (yes/no with passphrase)
 
 Everything can be configured directly in the menu – no need to remember command-line flags!
+
+---
+
+## 📊 Live Status Monitoring
+
+### Interactive Status Display
+
+The status display provides real-time monitoring of running backups:
+
+**Access via:**
+- Menu option 8 (Progress)
+- Command line: `sudo ./panzerbackup.sh status`
+
+**Features:**
+- **Real-time updates** every 2 seconds
+- **Color-coded status** for quick visual feedback:
+  - 🟢 Green: Success messages (e.g., "Backup completed successfully")
+  - 🟡 Yellow: Active operations (e.g., "BACKUP: dd | zstd running...")
+  - 🔴 Red: Errors or failures
+- **Live log streaming** shows last 50 lines of activity
+- **Process tracking** with PID information
+- **Non-blocking** - exit with CTRL+C (backup continues running!)
+- **Reconnect anytime** - even after SSH disconnect, status is preserved
+
+**Example Status Output:**
+```
+==========================================
+    Panzerbackup - Live Status
+==========================================
+
+CTRL+C to stop viewing (backup keeps running!)
+
+Current status: BACKUP: dd | zstd running...
+==========================================
+Log (last 50 lines):
+==========================================
+=== 2025-12-23 14:30:15 | Starting panzer-backup...
+  - VM 100: QGA ok → fsfreeze-freeze
+  - VM 101: no QGA → suspend
+[*] dd | zstd | tee | sha256sum …
+15360+0 records in
+15360+0 records out
+1073741824 bytes (1.1 GB, 1.0 GiB) copied, 45.2 s, 23.7 MB/s
+...
+```
+
+### Status When No Backup Running
+
+If no backup is currently active:
+- Shows "No backup is currently running"
+- Displays last known status
+- Option to return to menu
+
+### Background Backup Workflow
+
+1. **Start backup** via menu or CLI
+2. **Backup runs in background** - you get your prompt back immediately
+3. **Monitor progress** anytime with status command
+4. **Disconnect SSH** if needed - backup continues
+5. **Reconnect later** and check status - all information preserved
+6. **Completion notification** when backup finishes
 
 ---
 
@@ -179,6 +254,26 @@ sudo ./panzerbackup.sh restore --select-disk
 ```bash
 # Check integrity of latest backup
 sudo ./panzerbackup.sh verify
+```
+
+### Log Viewing
+
+```bash
+# View last 200 lines of log
+sudo ./panzerbackup.sh log
+
+# View specific number of lines
+sudo ./panzerbackup.sh log --lines 500
+
+# View specific log file
+sudo ./panzerbackup.sh log --file /path/to/custom.log
+```
+
+### Stop Running Backup
+
+```bash
+# Gracefully stop a running backup
+sudo ./panzerbackup.sh stop
 ```
 
 ### Available Flags
@@ -292,7 +387,7 @@ Even when systemd starts the job, you can always monitor progress:
 sudo ./panzerbackup.sh status
 ```
 
-**Important:** Detailed progress remains in the dedicated log `/mnt/panzerbackup-pm/panzerbackup.log` and status tracking `/tmp/panzerbackup-status`.
+**Important:** Detailed progress remains in the dedicated log `/mnt/panzerbackup-pm/panzerbackup.log` and status tracking `/run/panzerbackup/status`.
 
 The `status` command shows:
 - Current backup status
@@ -347,6 +442,13 @@ Backups are stored with the following naming scheme:
 - `.img.zst.gpg` - Compressed + encrypted image
 - `.sha256` - SHA256 checksum
 - `.sfdisk` - Partition table backup
+
+### Runtime Files
+Located in `/run/panzerbackup/`:
+- `status` - Current operation status
+- `pid` - Worker process PID
+- `worker.sh` - Background worker script
+- `startup.log` - Worker startup messages
 
 ---
 
@@ -442,6 +544,17 @@ sudo ./panzerbackup.sh status
 # Exit monitoring with CTRL+C (backup continues!)
 ```
 
+### Remote Monitoring via SSH
+```bash
+# Start backup on remote server
+ssh root@server 'cd /root/panzerbackup && ./panzerbackup.sh backup --name prod --compress'
+
+# Disconnect SSH - backup continues
+
+# Later: Reconnect and check status
+ssh root@server '/root/panzerbackup/panzerbackup.sh status'
+```
+
 ---
 
 ## 📄 License
@@ -476,6 +589,12 @@ Every bit of feedback helps make Panzerbackup even more robust.
 - **Named Backups**: Assign custom names to distinguish backups from different systems
 - **Background Execution**: Backups run in background and survive SSH disconnections
 - **Live Status Monitoring**: Real-time progress tracking with `./panzerbackup.sh status`
+  - Color-coded status indicators (green/yellow/red)
+  - Live log streaming (last 50 lines)
+  - Process tracking with PID information
+  - Persistent status across terminal sessions
+- **Enhanced Log Viewing**: View logs with customizable line count via menu or CLI
+- **Stop Command**: Gracefully stop running backups with `./panzerbackup.sh stop`
 - **Systemd Integration**: Native service and timer support for automated scheduling
 - **Enhanced Status Display**: Shows running backups, logs, and systemd information
 - **Improved Robustness**: Worker process isolation and error handling
@@ -490,8 +609,11 @@ If you're upgrading from an older version:
 
 1. **No breaking changes** - all existing backups remain compatible
 2. **New status command** - use `./panzerbackup.sh status` to monitor backups
-3. **Optional systemd setup** - recommended for scheduled backups (see above)
-4. **Named backups** - now prompted during interactive backup or via `--name` flag
+3. **New log command** - use `./panzerbackup.sh log` for quick log viewing
+4. **New stop command** - use `./panzerbackup.sh stop` to gracefully stop running backups
+5. **Optional systemd setup** - recommended for scheduled backups (see above)
+6. **Named backups** - now prompted during interactive backup or via `--name` flag
+7. **Runtime directory** - status files now in `/run/panzerbackup/` (automatically created)
 
 ---
 
