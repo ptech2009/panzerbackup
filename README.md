@@ -74,10 +74,11 @@ LANG_CHOICE=de ./panzerbackup.sh
 * Combines seamlessly with compression: `dd | zstd | gpg`
 
 ### ✅ **Integrity Verification**
-* SHA256 checksum is generated inline during backup (no second pass)
+* SHA256 checksum is generated inline during backup
 * Automatic verification after backup completes
 * Symlinks (`LATEST_OK`, `LATEST_OK.sha256`, `LATEST_OK.sfdisk`) always point to the last valid backup
 * Dedicated verify mode to check existing backups
+* On large backups, the finalization phase can take a long time because the script may read the completed backup file again for checksum verification. During this phase, the job can appear idle even though integrity verification is still in progress.
 
 ### ✅ **Space Management**
 * Checks available disk space before starting backup
