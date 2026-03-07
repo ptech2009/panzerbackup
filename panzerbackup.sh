@@ -1,21 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# =====[ Sane defaults for env -i + set -u ]===================================
 : "${LC_ALL:=C}"; export LC_ALL
 : "${LANG:=C}";   export LANG
 : "${PATH:=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"; export PATH
 : "${HOME:=/root}"; export HOME
 
+# ====== COLORS (nur interaktiv) ==============================================
 if [[ -t 1 ]]; then
   R=$'\e[31m'
   G=$'\e[32m'
   Y=$'\e[33m'
+  B=$'\e[34m'
   NC=$'\e[0m'
 else
-  R=""; G=""; Y=""; NC=""
+  R=""; G=""; Y=""; B=""; NC=""
 fi
 
+# =====================[ Language Selection / Sprachwahl ]=====================
 LANG_CHOICE="${LANG_CHOICE:-}"
+
 if [[ -z "$LANG_CHOICE" && -t 0 && -t 1 ]]; then
   echo "Bitte Sprache wählen / Please select language:"
   echo "1) Deutsch"
@@ -30,13 +35,17 @@ elif [[ -z "$LANG_CHOICE" ]]; then
   LANG_CHOICE="en"
 fi
 
-M() { if [[ "$LANG_CHOICE" == "de" ]]; then echo -e "$1"; else echo -e "$2"; fi; }
+M() {
+  if [[ "$LANG_CHOICE" == "de" ]]; then echo -e "$1"; else echo -e "$2"; fi
+}
 ASK() {
   local qd="$1" qe="$2" ans
   if [[ "$LANG_CHOICE" == "de" ]]; then
-    read -r -p "$qd [j/N]: " ans; [[ "${ans:-}" =~ ^([JjYy])$ ]]
+    read -r -p "$qd [j/N]: " ans
+    [[ "${ans:-}" =~ ^([JjYy])$ ]]
   else
-    read -r -p "$qe [y/N]: " ans; [[ "${ans:-}" =~ ^([YyJj])$ ]]
+    read -r -p "$qe [y/N]: " ans
+    [[ "${ans:-}" =~ ^([YyJj])$ ]]
   fi
 }
 die() { M "❌ $1" "❌ $2" >&2; exit 1; }
@@ -44,6 +53,7 @@ msg() { M "$1" "$2"; }
 need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Benötigtes Kommando fehlt: $1" "Required command missing: $1"; }
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
 
+# =====================[ Status-Tracking ]=====================================
 RUN_DIR="${RUN_DIR:-/run/panzerbackup}"
 mkdir -p "$RUN_DIR"
 STATUS_FILE="${STATUS_FILE:-$RUN_DIR/status}"
@@ -59,20 +69,18 @@ get_status() {
     [[ "$LANG_CHOICE" == "en" ]] && echo "Initializing..." || echo "Initialisiere..."
   fi
 }
-
 get_status_formatted() {
   local s; s="$(get_status)"
   if [[ "$s" == *"FEHLER"* || "$s" == *"ERROR"* || "$s" == *"failed"* || "$s" == *"abgebrochen"* || "$s" == *"aborted"* ]]; then
     echo "${R}${s}${NC}"
   elif [[ "$s" == *"Erfolgreich"* || "$s" == *"completed successfully"* || "$s" == *"Erfolgreich abgeschlossen"* || "$s" == *"Backup completed"* ]]; then
     echo "${G}${s}${NC}"
-  elif [[ "$s" == *"BACKUP"* || "$s" == *"RESTORE"* || "$s" == *"dd"* || "$s" == *"zstd"* || "$s" == *"gpg"* ]]; then
+  elif [[ "$s" == *"BACKUP"* || "$s" == *"RESTORE"* || "$s" == *"dd"* || "$s" == *"zstd"* || "$s" == *"gpg"* || "$s" == *"Finalizing"* || "$s" == *"Finalisiere"* ]]; then
     echo "${Y}${s}${NC}"
   else
     echo "$s"
   fi
 }
-
 clear_status_for_new_run() { : > "$STATUS_FILE"; }
 
 is_running() {
@@ -87,6 +95,12 @@ is_running() {
   return 1
 }
 
+# =====================[ Anzeige/Performance ]=================================
+LIVE_LOG_LINES="${LIVE_LOG_LINES:-20}"
+LOG_VIEW_LINES_DEFAULT="${LOG_VIEW_LINES_DEFAULT:-100}"
+MENU_REFRESH_SECONDS="${MENU_REFRESH_SECONDS:-2}"
+
+# =====================[ Power inhibit ]=======================================
 run_inhibited() {
   local why="${1:?}"; shift
   if has_cmd systemd-inhibit; then
@@ -96,6 +110,7 @@ run_inhibited() {
   fi
 }
 
+# =====================[ Systemdisk-Erkennung ]================================
 detect_system_disk() {
   need_cmd lsblk; need_cmd awk
   local root_dev
@@ -137,6 +152,7 @@ detect_system_disk() {
   return 1
 }
 
+# =====================[ Disk-Auswahl ]========================================
 list_available_disks() {
   need_cmd lsblk
   lsblk -dnpo NAME,SIZE,MODEL,TYPE | while IFS= read -r line; do
@@ -169,11 +185,11 @@ select_target_disk() {
 
   if (( ${#disks[@]} == 1 )); then
     M "[*] Nur eine Disk verfügbar: ${disks[0]}" "[*] Only one disk available: ${disks[0]}"
-    echo "${disks[0]}"; return 0
+    echo "${disks[0]}"
+    return 0
   fi
 
   echo
-  local choice
   if [[ "$LANG_CHOICE" == "de" ]]; then
     read -rp "Ziel-Disk auswählen (1-${#disks[@]}): " choice
   else
@@ -189,7 +205,8 @@ select_target_disk() {
   echo "$selected"
 }
 
-SELECT_BACKUP="${SELECT_BACKUP:-}"
+# =====================[ Backup-Ziel ]=========================================
+SELECT_BACKUP=""
 detect_backup_dir() {
   local label="${1:?}"
   need_cmd lsblk
@@ -205,12 +222,13 @@ detect_backup_dir() {
   for line in "${CANDS[@]}"; do
     IFS=$'\t' read -r dev lab mp fs <<<"$line"
     if [[ -n "$mp" && -w "$mp" ]]; then
-      echo "$mp"; return 0
+      echo "$mp"
+      return 0
     fi
   done
 
   local pick=1
-  if (( ${#CANDS[@]} > 1 )) && [[ ( -t 0 && -t 1 ) || -n "${SELECT_BACKUP:-}" ]]; then
+  if (( ${#CANDS[@]} > 1 )) && [[ -t 0 && -t 1 || -n "${SELECT_BACKUP:-}" ]]; then
     M "[*] Mehrere mögliche Backup-Ziele gefunden (Label enthält: \"$label\"):" \
       "[*] Multiple candidate backup targets found (label contains: \"$label\"):"
     local i=1
@@ -237,6 +255,7 @@ detect_backup_dir() {
   return 1
 }
 
+# =====================[ Backup-Name ]=========================================
 prompt_backup_name() {
   local default_name="$1"
   if [[ -n "${BACKUP_NAME:-}" ]]; then
@@ -246,7 +265,6 @@ prompt_backup_name() {
 
   if [[ -t 0 && -t 1 ]]; then
     echo
-    local input_name
     if [[ "$LANG_CHOICE" == "de" ]]; then
       read -rp "Backup-Name eingeben (z.B. 'proxmox-host1') [Standard: $default_name]: " input_name
     else
@@ -268,14 +286,16 @@ prompt_backup_name() {
   fi
 }
 
+# =====================[ Latest Backup Finder ]================================
 find_latest_valid() {
   local dir="${1:?}"
   if [[ -L "$dir/LATEST_OK" ]]; then
-    local t; t="$(readlink -f "$dir/LATEST_OK" || true)"; [[ -f "$t" ]] && echo "$t" && return 0
+    local t; t="$(readlink -f "$dir/LATEST_OK" || true)"
+    [[ -f "$t" ]] && echo "$t" && return 0
   fi
   mapfile -t IMGS < <(ls -1t \
     "$dir"/panzer_*.img.zst.gpg "$dir"/panzer_*.img.gpg \
-    "$dir"/panzer_*.img.zst     "$dir"/panzer_*.img 2>/dev/null || true)
+    "$dir"/panzer_*.img.zst "$dir"/panzer_*.img 2>/dev/null || true)
   for img in "${IMGS[@]:-}"; do
     [[ -f "${img}.sha256" ]] || continue
     M "  - Prüfe $(basename "$img") ..." "  - Checking $(basename "$img") ..."
@@ -283,8 +303,12 @@ find_latest_valid() {
   done
   return 1
 }
-find_latest_any() { local dir="${1:?}"; ls -1t "$dir"/panzer_*.img.zst.gpg "$dir"/panzer_*.img.gpg "$dir"/panzer_*.img.zst "$dir"/panzer_*.img 2>/dev/null | head -n1 || true; }
+find_latest_any() {
+  local dir="${1:?}"
+  ls -1t "$dir"/panzer_*.img.zst.gpg "$dir"/panzer_*.img.gpg "$dir"/panzer_*.img.zst "$dir"/panzer_*.img 2>/dev/null | head -n1 || true
+}
 
+# =====================[ zstd ensure ]=========================================
 ensure_zstd_if_needed() {
   local want="$1"
   [[ "$want" == "off" ]] && return 0
@@ -308,6 +332,125 @@ ensure_zstd_if_needed() {
   fi
 }
 
+# =====================[ Platzprüfung ]========================================
+get_free_bytes() {
+  need_cmd df
+  df -PB1 "$BACKUP_DIR" | awk 'NR==2 {print $4}'
+}
+
+human_bytes() {
+  local n="${1:-0}"
+  if has_cmd numfmt; then
+    numfmt --to=iec-i --suffix=B "$n"
+  else
+    echo "${n} bytes"
+  fi
+}
+
+estimate_required_backup_bytes() {
+  need_cmd blockdev
+  local raw_size
+  raw_size="$(blockdev --getsize64 "$DISK")"
+  echo $(( raw_size + MIN_FREE_BYTES ))
+}
+
+list_existing_backups_oldest_first() {
+  ls -1tr \
+    "$BACKUP_DIR"/panzer_*.img \
+    "$BACKUP_DIR"/panzer_*.img.zst \
+    "$BACKUP_DIR"/panzer_*.img.gpg \
+    "$BACKUP_DIR"/panzer_*.img.zst.gpg 2>/dev/null || true
+}
+
+cleanup_stale_partial_files() {
+  msg "[*] Prüfe auf alte unvollständige Backup-Dateien (*.part) ..." \
+      "[*] Checking for stale partial backup files (*.part) ..."
+  find "$BACKUP_DIR" -maxdepth 1 -type f \( -name "*.part" -o -name "*.sha256.part" \) -print 2>/dev/null | while read -r f; do
+    [[ -n "$f" ]] || continue
+    msg "  - Entferne unvollständige Datei: $(basename "$f")" \
+        "  - Removing incomplete file: $(basename "$f")"
+    rm -f -- "$f"
+  done
+}
+
+refresh_latest_ok_links() {
+  local newest_valid=""
+  newest_valid="$(find_latest_valid "$BACKUP_DIR" || true)"
+  if [[ -n "$newest_valid" && -f "$newest_valid" ]]; then
+    local base="${newest_valid##*/}"
+    local sfdisk_file="${base%.img*}.sfdisk"
+    ln -sfn "$base" "${BACKUP_DIR}/LATEST_OK"
+    [[ -f "${BACKUP_DIR}/${base}.sha256" ]] && ln -sfn "${base}.sha256" "${BACKUP_DIR}/LATEST_OK.sha256" || rm -f "${BACKUP_DIR}/LATEST_OK.sha256"
+    [[ -f "${BACKUP_DIR}/${sfdisk_file}" ]] && ln -sfn "${sfdisk_file}" "${BACKUP_DIR}/LATEST_OK.sfdisk" || rm -f "${BACKUP_DIR}/LATEST_OK.sfdisk"
+  else
+    rm -f "${BACKUP_DIR}/LATEST_OK" "${BACKUP_DIR}/LATEST_OK.sha256" "${BACKUP_DIR}/LATEST_OK.sfdisk"
+  fi
+}
+
+remove_backup_with_metadata() {
+  local old="${1:?}"
+  [[ -f "$old" ]] || return 0
+  local old_base old_sfdisk latest_target
+  old_base="$(basename "$old")"
+  old_sfdisk="${old_base%.img*}.sfdisk"
+  latest_target=""
+  if [[ -L "${BACKUP_DIR}/LATEST_OK" ]]; then
+    latest_target="$(basename "$(readlink -f "${BACKUP_DIR}/LATEST_OK" 2>/dev/null || true)")"
+  fi
+  rm -f -- "$old" "${old}.sha256" "${BACKUP_DIR}/${old_sfdisk}"
+  if [[ "$latest_target" == "$old_base" ]]; then
+    refresh_latest_ok_links
+  fi
+}
+
+cleanup_oldest_backups_until_enough_space() {
+  local required free
+  required="$(estimate_required_backup_bytes)"
+  free="$(get_free_bytes)"
+
+  msg "[*] Freier Speicher auf Backup-Ziel: $(human_bytes "$free")" \
+      "[*] Free space on backup target: $(human_bytes "$free")"
+  msg "[*] Benötigt (Rohgröße Disk + Reserve): $(human_bytes "$required")" \
+      "[*] Required (raw disk size + reserve): $(human_bytes "$required")"
+
+  if (( free >= required )); then
+    msg "[✓] Genug Speicherplatz vorhanden." "[✓] Enough free space available."
+    return 0
+  fi
+
+  [[ "$AUTO_DELETE_OLDEST" == "1" ]] || \
+    die "Zu wenig Speicherplatz auf dem Backup-Ziel und automatisches Löschen ist deaktiviert." \
+        "Not enough free space on backup target and automatic deletion is disabled."
+
+  msg "[!] Zu wenig Speicherplatz. Älteste Backups werden automatisch entfernt..." \
+      "[!] Not enough free space. Oldest backups will be deleted automatically..."
+
+  local old free_now
+  mapfile -t OLD_BACKUPS < <(list_existing_backups_oldest_first)
+  (( ${#OLD_BACKUPS[@]} > 0 )) || \
+    die "Kein altes Backup zum Löschen vorhanden, aber zu wenig Speicherplatz." \
+        "No old backup available for deletion, but there is not enough free space."
+
+  for old in "${OLD_BACKUPS[@]}"; do
+    [[ -f "$old" ]] || continue
+    msg "  - Lösche altes Backup: $(basename "$old")" \
+        "  - Deleting old backup: $(basename "$old")"
+    remove_backup_with_metadata "$old"
+    free_now="$(get_free_bytes)"
+    msg "    → Freier Speicher jetzt: $(human_bytes "$free_now")" \
+        "    → Free space now: $(human_bytes "$free_now")"
+    if (( free_now >= required )); then
+      msg "[✓] Genug Speicherplatz freigeräumt." "[✓] Enough free space has been freed."
+      return 0
+    fi
+  done
+
+  free_now="$(get_free_bytes)"
+  die "Trotz Löschen alter Backups nicht genug Speicher frei. Frei: $(human_bytes "$free_now"), benötigt: $(human_bytes "$required")" \
+      "Still not enough free space after deleting old backups. Free: $(human_bytes "$free_now"), required: $(human_bytes "$required")"
+}
+
+# =====================[ Defaults ]============================================
 BACKUP_LABEL="${BACKUP_LABEL:-PANZERBACKUP}"
 DISK="${DISK_OVERRIDE:-$(detect_system_disk || true)}"
 [[ -b "${DISK:-}" ]] || die "Konnte Systemdisk nicht ermitteln" "Could not determine system disk"
@@ -316,6 +459,8 @@ BACKUP_DIR="$(detect_backup_dir "$BACKUP_LABEL" || true)"
 [[ -d "${BACKUP_DIR:-}" && -w "${BACKUP_DIR:-}" ]] || die "Backup-Platte mit Label $BACKUP_LABEL nicht gefunden/ nicht schreibbar" "Backup drive with label $BACKUP_LABEL not found / not writable"
 
 KEEP="${KEEP:-3}"
+MIN_FREE_BYTES="${MIN_FREE_BYTES:-2147483648}"
+AUTO_DELETE_OLDEST="${AUTO_DELETE_OLDEST:-1}"
 DATE="$(date +'%Y-%m-%d_%H-%M-%S')"
 BACKUP_NAME="${BACKUP_NAME:-}"
 IMG_PREFIX=""
@@ -335,9 +480,9 @@ TEMP_FILE=""
 TEMP_SHA=""
 LOG_FILE_DEFAULT="${BACKUP_DIR}/panzerbackup.log"
 
+# =====================[ Prompts ]============================================
 prompt_post_action() {
   echo
-  local pa
   if [[ "$LANG_CHOICE" == "de" ]]; then
     echo "Aktion NACH dem ${1:-Vorgang}?"
     echo "1) Nichts tun"; echo "2) Neu starten"; echo "3) Herunterfahren"
@@ -357,19 +502,17 @@ prompt_post_action() {
 }
 
 prompt_encryption() {
-  if ASK "Backup verschlüsseln (GnuPG AES-256)?" "Encrypt backup (GnuPG AES-256)?" ; then
+  if ASK "Backup verschlüsseln (GnuPG AES-256)?" "Encrypt backup (GnuPG AES-256)?"; then
     need_cmd gpg
     ENCRYPT_MODE="gpg"
-    local p1 p2
     if [[ "$LANG_CHOICE" == "de" ]]; then
       read -rsp "Passphrase: " p1; echo
       read -rsp "Passphrase wiederholen: " p2; echo
-      [[ "$p1" == "$p2" ]] || die "Passphrasen stimmen nicht überein" "Passphrases do not match"
     else
       read -rsp "Passphrase: " p1; echo
       read -rsp "Repeat passphrase: " p2; echo
-      [[ "$p1" == "$p2" ]] || die "Passphrases do not match" "Passphrases do not match"
     fi
+    [[ "$p1" == "$p2" ]] || die "Passphrasen stimmen nicht überein" "Passphrases do not match"
     ENCRYPT_PASSPHRASE="$p1"; unset p1 p2
     msg "→ Verschlüsselung: aktiv (gpg)" "→ Encryption: enabled (gpg)"
   else
@@ -378,44 +521,47 @@ prompt_encryption() {
   fi
 }
 
+# =====================[ Arg Parser ]=========================================
 parse_backup_flags() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       resume-orphans) resume_orphans; exit 0 ;;
       stop) do_stop; exit 0 ;;
-      --compress)      COMPRESS_MODE="on"; shift ;;
-      --no-compress)   COMPRESS_MODE="off"; shift ;;
-      --zstd-level)    ZSTD_LEVEL="${2:-6}"; shift 2 ;;
-      --post)          POST_ACTION="${2:-none}"; POST_ACTION_PRESET="1"; shift 2 ;;
-      --encrypt)       ENCRYPT_MODE="gpg"; shift ;;
-      --no-encrypt)    ENCRYPT_MODE="off"; shift ;;
-      --passfile)      ENCRYPT_PASSPHRASE="$(<"$2")"; shift 2 ;;
+      --compress) COMPRESS_MODE="on"; shift ;;
+      --no-compress) COMPRESS_MODE="off"; shift ;;
+      --zstd-level) ZSTD_LEVEL="${2:-6}"; shift 2 ;;
+      --post) POST_ACTION="${2:-none}"; POST_ACTION_PRESET="1"; shift 2 ;;
+      --encrypt) ENCRYPT_MODE="gpg"; shift ;;
+      --no-encrypt) ENCRYPT_MODE="off"; shift ;;
+      --passfile) ENCRYPT_PASSPHRASE="$(<"$2")"; shift 2 ;;
       --select-backup) SELECT_BACKUP="true"; shift ;;
-      --disk)          DISK="$2"; shift 2 ;;
-      --name)          BACKUP_NAME="$2"; shift 2 ;;
+      --disk) DISK="$2"; shift 2 ;;
+      --name) BACKUP_NAME="$2"; shift 2 ;;
       *) break ;;
     esac
   done
+  printf '%s\0' "$@"
 }
-
 parse_restore_flags() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --dry-run)       RESTORE_DRY_RUN="--dry-run"; shift ;;
-      --target)        TARGET_DISK="$2"; shift 2 ;;
-      --select-disk)   SELECT_DISK="true"; shift ;;
-      --post)          POST_ACTION="${2:-none}"; POST_ACTION_PRESET="1"; shift 2 ;;
-      --passfile)      ENCRYPT_PASSPHRASE="$(<"$2")"; shift 2 ;;
+      --dry-run) RESTORE_DRY_RUN="--dry-run"; shift ;;
+      --target) TARGET_DISK="$2"; shift 2 ;;
+      --select-disk) SELECT_DISK="true"; shift ;;
+      --post) POST_ACTION="${2:-none}"; POST_ACTION_PRESET="1"; shift 2 ;;
+      --passfile) ENCRYPT_PASSPHRASE="$(<"$2")"; shift 2 ;;
       --select-backup) SELECT_BACKUP="true"; shift ;;
-      --disk)          DISK="$2"; shift 2 ;;
+      --disk) DISK="$2"; shift 2 ;;
       *) break ;;
     esac
   done
+  printf '%s\0' "$@"
 }
 
+# =====================[ Log ]================================================
 do_log() {
   local file="${1:-$LOG_FILE_DEFAULT}"
-  local lines="${2:-200}"
+  local lines="${2:-$LOG_VIEW_LINES_DEFAULT}"
   if [[ ! -f "$file" ]]; then
     msg "(Kein Log vorhanden unter $file)" "(No log present at $file)"
     return 1
@@ -432,21 +578,21 @@ view_log() {
   if [[ ! -f "$LOG_FILE_DEFAULT" ]]; then
     msg "${R}Kein Logfile gefunden: $LOG_FILE_DEFAULT${NC}" "${R}No log file found: $LOG_FILE_DEFAULT${NC}"
   else
-    msg "Zeige die letzten 200 Zeilen von:" "Showing last 200 lines of:"
+    msg "Zeige die letzten ${LOG_VIEW_LINES_DEFAULT} Zeilen von:" "Showing last ${LOG_VIEW_LINES_DEFAULT} lines of:"
     echo "  $LOG_FILE_DEFAULT"
     echo "------------------------------------------"
-    tail -n 200 "$LOG_FILE_DEFAULT"
+    tail -n "$LOG_VIEW_LINES_DEFAULT" "$LOG_FILE_DEFAULT"
   fi
   echo "------------------------------------------"
   if [[ "${LANG_CHOICE}" == "en" ]]; then read -rp "Press Enter to return..." _ || true
   else read -rp "Drücke Enter um zurückzukehren..." _ || true; fi
 }
 
+# =====================[ Proxmox Resume ]======================================
 resume_orphans() {
   if has_cmd qm; then
     while read -r id; do
       [[ -z "$id" ]] && continue
-      local st
       st="$(qm status "$id" 2>/dev/null | awk '{print $2}' || true)"
       if [[ "$st" == "paused" ]]; then
         msg "  - qm resume $id" "  - qm resume $id"
@@ -464,6 +610,7 @@ resume_orphans() {
   fi
 }
 
+# =====================[ Stop ]================================================
 do_stop() {
   if ! is_running; then
     msg "Kein Backup läuft." "No backup is running."
@@ -488,25 +635,35 @@ do_stop() {
   fi
 
   rm -f "$PID_FILE"
-  set_status "GESTOPPT: Manuell abgebrochen"
+  if [[ "$LANG_CHOICE" == "de" ]]; then
+    set_status "GESTOPPT: Manuell abgebrochen"
+  else
+    set_status "STOPPED: Aborted manually"
+  fi
   resume_orphans
   msg "${R}Vorgang gestoppt.${NC}" "${R}Job stopped.${NC}"
 }
 
+# =====================[ Backup Worker ]=======================================
 do_backup_background() {
-  set_status "BACKUP: Wird gestartet..."
+  if [[ "$LANG_CHOICE" == "de" ]]; then
+    set_status "BACKUP: Wird gestartet..."
+  else
+    set_status "BACKUP: Starting..."
+  fi
 
   cat > "$WORKER_SCRIPT" << 'EOFWORKER'
 #!/usr/bin/env bash
 set -euo pipefail
 set -E
-trap 'rc=$?; set_status "FEHLER: Backup abgebrochen (RC=$rc)"; echo "FEHLER (Backup Worker) in Zeile $LINENO: $BASH_COMMAND (RC=$rc)"; exit $rc' ERR
+trap 'rc=$?; if [[ "${LANG_CHOICE:-de}" == "de" ]]; then set_status "FEHLER: Backup abgebrochen (RC=$rc)"; else set_status "ERROR: Backup aborted (RC=$rc)"; fi; echo "ERROR (Backup Worker) line $LINENO: $BASH_COMMAND (RC=$rc)"; exit $rc' ERR
 
 export LC_ALL=C
 : "${PATH:=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
 
 set_status() { echo "$1" > "$STATUS_FILE"; }
 msg() { if [[ "${LANG_CHOICE:-de}" == "de" ]]; then echo "$1"; else echo "$2"; fi; }
+status_msg() { if [[ "${LANG_CHOICE:-de}" == "de" ]]; then echo "$1"; else echo "$2"; fi; }
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 run_inhibited() {
@@ -518,10 +675,58 @@ run_inhibited() {
   fi
 }
 
+find_latest_valid_worker() {
+  local dir="${1:?}"
+  if [[ -L "$dir/LATEST_OK" ]]; then
+    local t
+    t="$(readlink -f "$dir/LATEST_OK" || true)"
+    [[ -f "$t" ]] && echo "$t" && return 0
+  fi
+  mapfile -t IMGS < <(ls -1t \
+    "$dir"/panzer_*.img.zst.gpg "$dir"/panzer_*.img.gpg \
+    "$dir"/panzer_*.img.zst "$dir"/panzer_*.img 2>/dev/null || true)
+  for img in "${IMGS[@]:-}"; do
+    [[ -f "${img}.sha256" ]] || continue
+    ( cd "$dir" && sha256sum -c "$(basename "$img").sha256" >/dev/null 2>&1 ) && { echo "$img"; return 0; }
+  done
+  return 1
+}
+
+refresh_latest_ok_links_worker() {
+  local newest_valid=""
+  newest_valid="$(find_latest_valid_worker "$BACKUP_DIR" || true)"
+  if [[ -n "$newest_valid" && -f "$newest_valid" ]]; then
+    local base sfdisk_file
+    base="$(basename "$newest_valid")"
+    sfdisk_file="${base%.img*}.sfdisk"
+    ln -sfn "$base" "${BACKUP_DIR}/LATEST_OK"
+    [[ -f "${BACKUP_DIR}/${base}.sha256" ]] && ln -sfn "${base}.sha256" "${BACKUP_DIR}/LATEST_OK.sha256" || rm -f "${BACKUP_DIR}/LATEST_OK.sha256"
+    [[ -f "${BACKUP_DIR}/${sfdisk_file}" ]] && ln -sfn "${sfdisk_file}" "${BACKUP_DIR}/LATEST_OK.sfdisk" || rm -f "${BACKUP_DIR}/LATEST_OK.sfdisk"
+  else
+    rm -f "${BACKUP_DIR}/LATEST_OK" "${BACKUP_DIR}/LATEST_OK.sha256" "${BACKUP_DIR}/LATEST_OK.sfdisk"
+  fi
+}
+
+remove_backup_with_metadata_worker() {
+  local old="${1:?}"
+  [[ -f "$old" ]] || return 0
+  local old_base old_sfdisk latest_target
+  old_base="$(basename "$old")"
+  old_sfdisk="${old_base%.img*}.sfdisk"
+  latest_target=""
+  if [[ -L "${BACKUP_DIR}/LATEST_OK" ]]; then
+    latest_target="$(basename "$(readlink -f "${BACKUP_DIR}/LATEST_OK" 2>/dev/null || true)")"
+  fi
+  rm -f -- "$old" "${old}.sha256" "${BACKUP_DIR}/${old_sfdisk}"
+  if [[ "$latest_target" == "$old_base" ]]; then
+    refresh_latest_ok_links_worker
+  fi
+}
+
 pve_quiesce_start() {
   FROZEN_QM=(); SUSPENDED_QM=(); RUN_CT=(); RUN_QM=()
   if ! has_cmd qm && ! has_cmd pct; then return 0; fi
-  set_status "BACKUP: Proxmox VMs/CTs werden pausiert..."
+  set_status "$(status_msg "BACKUP: Proxmox VMs/CTs werden pausiert..." "BACKUP: Pausing Proxmox VMs/CTs...")"
   msg "[*] Proxmox erkannt – beginne Quiesce" "[*] Proxmox detected – starting quiesce"
 
   if has_cmd qm; then
@@ -532,7 +737,7 @@ pve_quiesce_start() {
         if qm agent "$vm" fsfreeze-freeze >/dev/null 2>&1; then
           FROZEN_QM+=("$vm")
         else
-          msg "    ! freeze fehlgeschlagen → fallback suspend" "    ! freeze failed → falling back to suspend"
+          msg "    ! freeze fehlgeschlagen → fallback suspend" "    ! freeze failed → fallback suspend"
           qm suspend "$vm" >/dev/null 2>&1 || true
           SUSPENDED_QM+=("$vm")
         fi
@@ -555,7 +760,7 @@ pve_quiesce_start() {
 }
 
 pve_quiesce_end() {
-  set_status "BACKUP: VMs/CTs werden fortgesetzt..."
+  set_status "$(status_msg "BACKUP: VMs/CTs werden fortgesetzt..." "BACKUP: Resuming VMs/CTs...")"
   if has_cmd qm; then
     for vm in "${FROZEN_QM[@]:-}"; do
       msg "  - VM $vm: fsfreeze-thaw" "  - VM $vm: fsfreeze-thaw"
@@ -580,21 +785,21 @@ pve_quiesce_end() {
   echo "Backup Worker Start: $(date '+%Y-%m-%d %H:%M:%S')"
   echo "=========================================="
 
-  set_status "BACKUP: Initialisiere..."
+  set_status "$(status_msg "BACKUP: Initialisiere..." "BACKUP: Initializing...")"
   msg "=== $(date) | Starte Panzer-Backup von $DISK -> $FINAL_FILE" \
       "=== $(date) | Starting panzer-backup from $DISK -> $FINAL_FILE"
 
   pve_quiesce_start
 
-  set_status "BACKUP: Erstelle Partitionstabelle..."
+  set_status "$(status_msg "BACKUP: Erstelle Partitionstabelle..." "BACKUP: Creating partition table...")"
   sfdisk -d "$DISK" > "${BACKUP_DIR}/${IMG_PREFIX}.sfdisk"
 
-  set_status "BACKUP: Kopiere Disk-Image..."
+  set_status "$(status_msg "BACKUP: Kopiere Disk-Image..." "BACKUP: Copying disk image...")"
   set -o pipefail
 
   if [[ "$USE_COMPRESS" == "true" && "$ENCRYPT_MODE" == "gpg" ]]; then
     msg "[*] dd | zstd | gpg | tee | sha256sum …" "[*] dd | zstd | gpg | tee | sha256sum …"
-    set_status "BACKUP: dd | zstd | gpg läuft..."
+    set_status "$(status_msg "BACKUP: dd | zstd | gpg läuft..." "BACKUP: dd | zstd | gpg running...")"
     run_inhibited "Panzerbackup läuft / Panzerbackup running" bash -c '
       dd if='"$DISK"' bs=64M status=progress \
       | zstd -T0 -'"$ZSTD_LEVEL"' -q \
@@ -605,7 +810,7 @@ pve_quiesce_end() {
     '
   elif [[ "$USE_COMPRESS" == "true" ]]; then
     msg "[*] dd | zstd | tee | sha256sum …" "[*] dd | zstd | tee | sha256sum …"
-    set_status "BACKUP: dd | zstd läuft..."
+    set_status "$(status_msg "BACKUP: dd | zstd läuft..." "BACKUP: dd | zstd running...")"
     run_inhibited "Panzerbackup läuft / Panzerbackup running" bash -c '
       dd if='"$DISK"' bs=64M status=progress \
       | zstd -T0 -'"$ZSTD_LEVEL"' -q \
@@ -615,7 +820,7 @@ pve_quiesce_end() {
     '
   elif [[ "$ENCRYPT_MODE" == "gpg" ]]; then
     msg "[*] dd | gpg | tee | sha256sum …" "[*] dd | gpg | tee | sha256sum …"
-    set_status "BACKUP: dd | gpg läuft..."
+    set_status "$(status_msg "BACKUP: dd | gpg läuft..." "BACKUP: dd | gpg running...")"
     run_inhibited "Panzerbackup läuft / Panzerbackup running" bash -c '
       dd if='"$DISK"' bs=64M status=progress \
       | gpg --batch --yes --symmetric --cipher-algo AES256 --pinentry-mode loopback --passphrase-fd 3 3<<<"'"$ENCRYPT_PASSPHRASE"'" \
@@ -625,7 +830,7 @@ pve_quiesce_end() {
     '
   else
     msg "[*] dd (roh) | tee | sha256sum …" "[*] dd (raw) | tee | sha256sum …"
-    set_status "BACKUP: dd (raw) läuft..."
+    set_status "$(status_msg "BACKUP: dd (raw) läuft..." "BACKUP: dd (raw) running...")"
     run_inhibited "Panzerbackup läuft / Panzerbackup running" bash -c '
       dd if='"$DISK"' bs=64M status=progress \
       | tee "'"$TEMP_FILE"'" \
@@ -635,7 +840,7 @@ pve_quiesce_end() {
   fi
   set +o pipefail
 
-  set_status "BACKUP: Finalisiere..."
+  set_status "$(status_msg "BACKUP: Finalisiere..." "BACKUP: Finalizing...")"
   sync
   mv -f "$TEMP_FILE" "$FINAL_FILE"
   mv -f "$TEMP_SHA" "${FINAL_FILE}.sha256"
@@ -647,24 +852,25 @@ pve_quiesce_end() {
     ln -sfn "$(basename "$FINAL_FILE")"         "${BACKUP_DIR}/LATEST_OK"
     ln -sfn "$(basename "$FINAL_FILE").sha256"  "${BACKUP_DIR}/LATEST_OK.sha256"
     ln -sfn "${IMG_PREFIX}.sfdisk"              "${BACKUP_DIR}/LATEST_OK.sfdisk"
-    set_status "BACKUP: Erfolgreich abgeschlossen - $(basename "$FINAL_FILE")"
+    set_status "$(status_msg "BACKUP: Erfolgreich abgeschlossen - $(basename "$FINAL_FILE")" "BACKUP: Completed successfully - $(basename "$FINAL_FILE")")"
     msg "✅ Backup erfolgreich abgeschlossen" "✅ Backup completed successfully"
   else
-    set_status "FEHLER: Checksum-Verify fehlgeschlagen"
+    set_status "$(status_msg "FEHLER: Checksum-Verify fehlgeschlagen" "ERROR: Checksum verify failed")"
     msg "❌ Backup fehlgeschlagen: Checksum-Verify" "❌ Backup failed: checksum verify"
     rm -f "$PID_FILE"
     exit 2
   fi
 
-  set_status "BACKUP: Räume alte Backups auf..."
+  set_status "$(status_msg "BACKUP: Räume alte Backups auf..." "BACKUP: Cleaning up old backups...")"
   mapfile -t ALL < <(ls -1t \
     "$BACKUP_DIR"/panzer_*.img "$BACKUP_DIR"/panzer_*.img.zst \
     "$BACKUP_DIR"/panzer_*.img.gpg "$BACKUP_DIR"/panzer_*.img.zst.gpg 2>/dev/null || true)
   if (( ${#ALL[@]} > KEEP )); then
     for old in "${ALL[@]:$KEEP}"; do
       msg "  - Entferne alt: $old" "  - Removing old: $old"
-      rm -f "$old" "${old}.sha256" "${old%.img*}.sfdisk" 2>/dev/null || true
+      remove_backup_with_metadata_worker "$old"
     done
+    refresh_latest_ok_links_worker
   fi
 
   echo "=========================================="
@@ -695,7 +901,11 @@ EOFWORKER
 
   sleep 2
   if ! (ps -p "$worker_pid" >/dev/null 2>&1 || pgrep -P "$worker_pid" >/dev/null 2>&1); then
-    set_status "FEHLER: Worker-Start fehlgeschlagen – siehe $STARTUP_LOG"
+    if [[ "$LANG_CHOICE" == "de" ]]; then
+      set_status "FEHLER: Worker-Start fehlgeschlagen – siehe $STARTUP_LOG"
+    else
+      set_status "ERROR: Worker start failed – see $STARTUP_LOG"
+    fi
     msg "⚠️  WARNUNG: Worker-Prozess beendet sich sofort!" \
         "⚠️  WARNING: Worker process terminated immediately!"
     msg "   Prüfe: cat $STARTUP_LOG" \
@@ -705,6 +915,7 @@ EOFWORKER
   fi
 }
 
+# =====================[ Backup ]==============================================
 do_backup() {
   if is_running; then
     msg "Ein Backup läuft bereits!" "A backup is already running!"
@@ -712,7 +923,7 @@ do_backup() {
     return 1
   fi
 
-  need_cmd dd; need_cmd sha256sum; need_cmd sfdisk
+  need_cmd dd; need_cmd sha256sum; need_cmd sfdisk; need_cmd blockdev; need_cmd df
   ensure_zstd_if_needed "$COMPRESS_MODE"
 
   local default_name backup_name
@@ -735,9 +946,18 @@ do_backup() {
   TEMP_FILE="${FINAL_FILE}.part"
   TEMP_SHA="${FINAL_FILE}.sha256.part"
 
+  cleanup_stale_partial_files
+  cleanup_oldest_backups_until_enough_space
+
   clear_status_for_new_run
   msg "" ""
   msg "Starte Backup im Hintergrund..." "Starting backup in background..."
+
+  msg "[Debug] Worker wird gestartet mit:" "[Debug] Starting worker with:"
+  msg "  - Disk: $DISK" "  - Disk: $DISK"
+  msg "  - Ziel: $FINAL_FILE" "  - Target: $FINAL_FILE"
+  msg "  - Kompression: $USE_COMPRESS" "  - Compression: $USE_COMPRESS"
+  msg "  - Verschlüsselung: $ENCRYPT_MODE" "  - Encryption: $ENCRYPT_MODE"
 
   do_backup_background
 
@@ -765,10 +985,12 @@ do_backup() {
   ENCRYPT_PASSPHRASE=""
 }
 
+# =====================[ Verify ]==============================================
 do_verify() {
   need_cmd sha256sum
   msg "=== $(date) | Prüfe letztes Backup ===" "=== $(date) | Verifying last backup ==="
-  local CAND; CAND="$(find_latest_any "$BACKUP_DIR" || true)"
+  local CAND
+  CAND="$(find_latest_any "$BACKUP_DIR" || true)"
   [[ -n "${CAND:-}" ]] || die "Keine Backup-Datei gefunden" "No backup file found"
   msg "Datei: $(basename "$CAND") | Größe: $(du -h "$CAND" | cut -f1)" \
       "File:  $(basename "$CAND") | Size:  $(du -h "$CAND" | cut -f1)"
@@ -776,6 +998,7 @@ do_verify() {
   msg "=== Verify OK ===" "=== Verify OK ==="
 }
 
+# =====================[ Restore ]=============================================
 do_restore() {
   need_cmd dd; need_cmd sha256sum; need_cmd lsblk; need_cmd mount; need_cmd chroot
   local restore_disk="${DISK}"
@@ -784,10 +1007,12 @@ do_restore() {
   elif [[ "${SELECT_DISK:-}" == "true" ]]; then
     restore_disk="$(select_target_disk "$DISK")"
   fi
+
   msg "=== $(date) | Starte Restore ${RESTORE_DRY_RUN:+(Dry-Run)} auf $restore_disk ===" \
       "=== $(date) | Starting restore ${RESTORE_DRY_RUN:+(dry-run)} to $restore_disk ==="
 
-  local CANDIDATE; CANDIDATE="$(find_latest_valid "$BACKUP_DIR" || true)" || die "Kein gültiges Backup gefunden" "No valid backup found"
+  local CANDIDATE
+  CANDIDATE="$(find_latest_valid "$BACKUP_DIR" || true)" || die "Kein gültiges Backup gefunden" "No valid backup found"
   msg "[✓] Verwende: $(basename "$CANDIDATE")" "[✓] Using: $(basename "$CANDIDATE")"
 
   if [[ "$RESTORE_DRY_RUN" == "--dry-run" ]]; then
@@ -803,8 +1028,11 @@ do_restore() {
   if [[ "$CANDIDATE" == *.gpg ]]; then
     need_cmd gpg
     if [[ -z "${ENCRYPT_PASSPHRASE:-}" ]]; then
-      if [[ "$LANG_CHOICE" == "de" ]]; then read -rsp "GPG-Passphrase für Restore: " ENCRYPT_PASSPHRASE; echo
-      else read -rsp "GPG passphrase for restore: " ENCRYPT_PASSPHRASE; echo; fi
+      if [[ "$LANG_CHOICE" == "de" ]]; then
+        read -rsp "GPG-Passphrase für Restore: " ENCRYPT_PASSPHRASE; echo
+      else
+        read -rsp "GPG passphrase for restore: " ENCRYPT_PASSPHRASE; echo
+      fi
     fi
     if [[ "$CANDIDATE" == *.zst.gpg ]]; then
       msg "[*] gpg -d | zstd -d | dd …" "[*] gpg -d | zstd -d | dd …"
@@ -833,12 +1061,13 @@ do_restore() {
 
   if [[ "$restore_disk" == "$DISK" ]]; then
     msg "[*] Versuche GRUB zu erneuern …" "[*] Attempting GRUB repair …"
-    local ROOT_CAND EFI_PART
+    local ROOT_CAND
     ROOT_CAND="$(lsblk -lnpo NAME,TYPE | awk '/lvm/ && /root/{print $1; exit}' || true)"
     if [[ -z "$ROOT_CAND" ]]; then
       ROOT_CAND="$(lsblk -lnpo NAME,FSTYPE,SIZE,TYPE "$restore_disk" | awk '$2 ~ /ext4|xfs/ && $4=="part"{print $1,$3}' | sort -k2 -h | tail -n1 | awk '{print $1}' || true)"
     fi
     if [[ -n "$ROOT_CAND" ]]; then
+      local EFI_PART
       EFI_PART="$(lsblk -lnpo NAME,PARTLABEL,PARTTYPE "$restore_disk" | awk '/EFI|EF00|ESP/{print $1; exit}' || true)"
       mkdir -p /mnt/restore
       mount "$ROOT_CAND" /mnt/restore || true
@@ -859,6 +1088,7 @@ do_restore() {
   post_action_maybe "restore"
 }
 
+# =====================[ Post Action ]=========================================
 post_action_maybe() {
   local phase="$1"
   case "$POST_ACTION" in
@@ -871,7 +1101,6 @@ post_action_maybe() {
     none|"")
       if [[ -z "${POST_ACTION_PRESET:-}" && -t 0 && -t 1 ]]; then
         echo
-        local pa
         if [[ "$LANG_CHOICE" == "de" ]]; then
           echo "Aktion nach $phase?"; echo "1) Nichts tun"; echo "2) Neu starten"; echo "3) Herunterfahren"
           read -rp "Auswahl (1/2/3): " pa
@@ -882,13 +1111,14 @@ post_action_maybe() {
         case "$pa$phase" in
           2*) systemctl reboot ;;
           3*) systemctl poweroff ;;
-          *)  : ;;
+          *) : ;;
         esac
       fi
       ;;
   esac
 }
 
+# =====================[ Live Status ]=========================================
 show_status() {
   { clear 2>/dev/null || printf '\033c'; } || true
   echo "=========================================="
@@ -901,8 +1131,11 @@ show_status() {
     echo ""
     [[ -s "$STATUS_FILE" ]] && msg "Letzter Status: $(get_status_formatted)" "Last status: $(get_status_formatted)"
     echo ""
-    if [[ "$LANG_CHOICE" == "de" ]]; then read -rp "Drücke Enter um zurückzukehren..." _ || true
-    else read -rp "Press Enter to return..." _ || true; fi
+    if [[ "$LANG_CHOICE" == "de" ]]; then
+      read -rp "Drücke Enter um zurückzukehren..." _ || true
+    else
+      read -rp "Press Enter to return..." _ || true
+    fi
     return 0
   fi
 
@@ -930,15 +1163,16 @@ show_status() {
     echo ""
     msg "Aktueller Status: $(get_status_formatted)" "Current status: $(get_status_formatted)"
     echo "=========================================="
-    msg "Log (letzte 50 Zeilen):" "Log (last 50 lines):"
+    msg "Log (letzte ${LIVE_LOG_LINES} Zeilen):" "Log (last ${LIVE_LOG_LINES} lines):"
     echo "=========================================="
 
     if [[ -f "$LOG_FILE_DEFAULT" ]]; then
-      tail -n 50 "$LOG_FILE_DEFAULT" 2>/dev/null || msg "(Log noch nicht verfügbar)" "(Log not yet available)"
+      tail -n "$LIVE_LOG_LINES" "$LOG_FILE_DEFAULT" 2>/dev/null || msg "(Log noch nicht verfügbar)" "(Log not yet available)"
     else
       msg "(Kein Log vorhanden)" "(No log present)"
     fi
-    sleep 2
+
+    sleep "$MENU_REFRESH_SECONDS"
   done
 
   echo ""
@@ -947,10 +1181,14 @@ show_status() {
   msg "Finaler Status: $(get_status_formatted)" "Final status: $(get_status_formatted)"
   echo "=========================================="
   echo ""
-  if [[ "$LANG_CHOICE" == "de" ]]; then read -rp "Drücke Enter um zurückzukehren..." _ || true
-  else read -rp "Press Enter to return..." _ || true; fi
+  if [[ "$LANG_CHOICE" == "de" ]]; then
+    read -rp "Drücke Enter um zurückzukehren..." _ || true
+  else
+    read -rp "Press Enter to return..." _ || true
+  fi
 }
 
+# =====================[ Menu ]===============================================
 show_menu() {
   { clear 2>/dev/null || printf '\033c'; } || true
   echo ""
@@ -968,17 +1206,25 @@ show_menu() {
   echo ""
 
   if is_running; then
-    echo "${Y}STATUS: Vorgang läuft!${NC}"
+    if [[ "$LANG_CHOICE" == "de" ]]; then
+      echo "${Y}STATUS: Vorgang läuft!${NC}"
+    else
+      echo "${Y}STATUS: Operation running!${NC}"
+    fi
     echo "        $(get_status_formatted)"
   else
-    echo "${G}STATUS: Bereit${NC}"
-    if [[ -s "$STATUS_FILE" ]]; then
+    if [[ "$LANG_CHOICE" == "de" ]]; then
+      echo "${G}STATUS: Bereit${NC}"
+    else
+      echo "${G}STATUS: Ready${NC}"
+    fi
+    [[ -s "$STATUS_FILE" ]] && {
       if [[ "$LANG_CHOICE" == "de" ]]; then
         echo "        Letzter Status: $(get_status_formatted)"
       else
         echo "        Last status: $(get_status_formatted)"
       fi
-    fi
+    }
   fi
 
   echo ""
@@ -1011,6 +1257,7 @@ show_menu() {
   fi
 }
 
+# =====================[ Help ]===============================================
 print_usage() {
   if [[ "$LANG_CHOICE" == "de" ]]; then
 cat <<USAGE
@@ -1026,6 +1273,14 @@ Aufruf:
   $0 log    [--lines N] [--file PATH]
   $0 stop
   $0         # interaktives Menü
+
+Environment:
+  MIN_FREE_BYTES=2147483648
+  AUTO_DELETE_OLDEST=1
+  LIVE_LOG_LINES=20
+  LOG_VIEW_LINES_DEFAULT=100
+  MENU_REFRESH_SECONDS=2
+
 USAGE
   else
 cat <<USAGE
@@ -1041,49 +1296,56 @@ Usage:
   $0 log    [--lines N] [--file PATH]
   $0 stop
   $0         # interactive menu
+
+Environment:
+  MIN_FREE_BYTES=2147483648
+  AUTO_DELETE_OLDEST=1
+  LIVE_LOG_LINES=20
+  LOG_VIEW_LINES_DEFAULT=100
+  MENU_REFRESH_SECONDS=2
+
 USAGE
   fi
 }
 
+# =====================[ Entry / CLI ]=========================================
 if [[ $# -gt 0 ]]; then
   case "$1" in
     backup)
-      shift; parse_backup_flags "$@"
+      shift; REMAINS=($(parse_backup_flags "$@"))
       if [[ -t 0 && -t 1 ]]; then
         [[ -z "${POST_ACTION_PRESET:-}" ]] && prompt_post_action "Backup"
         if [[ "${ENCRYPT_MODE}" == "off" && -z "${ENCRYPT_PASSPHRASE:-}" ]]; then prompt_encryption; fi
       fi
       do_backup ;;
     restore)
-      shift; parse_restore_flags "$@"
-      if [[ -t 0 && -t 1 && -z "${POST_ACTION_PRESET:-}" ]]; then prompt_post_action "Restore"; fi
+      shift; REMAINS=($(parse_restore_flags "$@"))
+      if [[ -t 0 && -t 1 && -z "${POST_ACTION_PRESET:-}" ]]; then
+        prompt_post_action "Restore"
+      fi
       do_restore ;;
-    verify)
-      do_verify ;;
-    status)
-      show_status ;;
+    verify) do_verify ;;
+    status) show_status ;;
     log)
       shift
-      local_lines=200
-      local_file="$LOG_FILE_DEFAULT"
+      LOG_TAIL_LINES="$LOG_VIEW_LINES_DEFAULT"
+      LOG_FILE_PATH="$LOG_FILE_DEFAULT"
       while [[ $# -gt 0 ]]; do
         case "$1" in
-          -n|--lines) local_lines="${2:-200}"; shift 2 ;;
-          -f|--file)  local_file="${2:-$LOG_FILE_DEFAULT}"; shift 2 ;;
+          -n|--lines) LOG_TAIL_LINES="${2:-$LOG_VIEW_LINES_DEFAULT}"; shift 2 ;;
+          -f|--file) LOG_FILE_PATH="${2:-$LOG_FILE_DEFAULT}"; shift 2 ;;
           *) break ;;
         esac
       done
-      do_log "$local_file" "$local_lines" ;;
-    stop)
-      do_stop ;;
-    help|--help|-h)
-      print_usage; exit 0 ;;
-    *)
-      print_usage; exit 1 ;;
+      do_log "$LOG_FILE_PATH" "$LOG_TAIL_LINES" ;;
+    stop) do_stop ;;
+    help|--help|-h) print_usage; exit 0 ;;
+    *) print_usage; exit 1 ;;
   esac
   exit 0
 fi
 
+# =====================[ Interactive Menu ]====================================
 while true; do
   show_menu
   if [[ "$LANG_CHOICE" == "en" ]]; then
@@ -1097,74 +1359,68 @@ while true; do
       COMPRESS_MODE="auto"
       BACKUP_NAME=""
       if [[ -t 0 && -t 1 ]]; then
-        if [[ "$LANG_CHOICE" == "de" ]]; then read -rp "Backup-Name (z.B. 'proxmox-node1') [Standard: $(hostname -s)]: " BACKUP_NAME
-        else read -rp "Backup name (e.g., 'proxmox-node1') [Default: $(hostname -s)]: " BACKUP_NAME; fi
+        if [[ "$LANG_CHOICE" == "de" ]]; then
+          read -rp "Backup-Name (z.B. 'proxmox-node1') [Standard: $(hostname -s)]: " BACKUP_NAME
+        else
+          read -rp "Backup name (e.g., 'proxmox-node1') [Default: $(hostname -s)]: " BACKUP_NAME
+        fi
         prompt_post_action "Backup"
         prompt_encryption
       fi
-      do_backup
-      ;;
+      do_backup ;;
     2)
       if [[ -t 0 && -t 1 && -z "${POST_ACTION_PRESET:-}" ]]; then prompt_post_action "Restore"; fi
-      do_restore
-      ;;
+      do_restore ;;
     3)
       RESTORE_DRY_RUN="--dry-run"
       if [[ -t 0 && -t 1 && -z "${POST_ACTION_PRESET:-}" ]]; then prompt_post_action "Restore"; fi
       do_restore
-      RESTORE_DRY_RUN=""
-      ;;
+      RESTORE_DRY_RUN="" ;;
     4)
       COMPRESS_MODE="off"
       BACKUP_NAME=""
       if [[ -t 0 && -t 1 ]]; then
-        if [[ "$LANG_CHOICE" == "de" ]]; then read -rp "Backup-Name (z.B. 'proxmox-node1') [Standard: $(hostname -s)]: " BACKUP_NAME
-        else read -rp "Backup name (e.g., 'proxmox-node1') [Default: $(hostname -s)]: " BACKUP_NAME; fi
+        if [[ "$LANG_CHOICE" == "de" ]]; then
+          read -rp "Backup-Name (z.B. 'proxmox-node1') [Standard: $(hostname -s)]: " BACKUP_NAME
+        else
+          read -rp "Backup name (e.g., 'proxmox-node1') [Default: $(hostname -s)]: " BACKUP_NAME
+        fi
         prompt_post_action "Backup"
         prompt_encryption
       fi
-      do_backup
-      ;;
+      do_backup ;;
     5)
       COMPRESS_MODE="on"
       BACKUP_NAME=""
       if [[ -t 0 && -t 1 ]]; then
-        if [[ "$LANG_CHOICE" == "de" ]]; then read -rp "Backup-Name (z.B. 'proxmox-node1') [Standard: $(hostname -s)]: " BACKUP_NAME
-        else read -rp "Backup name (e.g., 'proxmox-node1') [Default: $(hostname -s)]: " BACKUP_NAME; fi
+        if [[ "$LANG_CHOICE" == "de" ]]; then
+          read -rp "Backup-Name (z.B. 'proxmox-node1') [Standard: $(hostname -s)]: " BACKUP_NAME
+        else
+          read -rp "Backup name (e.g., 'proxmox-node1') [Default: $(hostname -s)]: " BACKUP_NAME
+        fi
         prompt_post_action "Backup"
         prompt_encryption
       fi
-      do_backup
-      ;;
+      do_backup ;;
     6)
       SELECT_DISK="true"
       if [[ -t 0 && -t 1 && -z "${POST_ACTION_PRESET:-}" ]]; then prompt_post_action "Restore"; fi
       do_restore
-      SELECT_DISK=""
-      ;;
+      SELECT_DISK="" ;;
     7)
       { clear 2>/dev/null || printf '\033c'; } || true
       do_verify
       if [[ "$LANG_CHOICE" == "en" ]]; then read -rp "Press Enter to continue..." _ || true
-      else read -rp "Drücke Enter um fortzufahren..." _ || true; fi
-      ;;
-    8)
-      show_status
-      ;;
-    9)
-      view_log
-      ;;
+      else read -rp "Drücke Enter um fortzufahren..." _ || true; fi ;;
+    8) show_status ;;
+    9) view_log ;;
     S|s)
       do_stop
       if [[ "$LANG_CHOICE" == "en" ]]; then read -rp "Press Enter to continue..." _ || true
-      else read -rp "Drücke Enter um fortzufahren..." _ || true; fi
-      ;;
-    0)
-      exit 0
-      ;;
+      else read -rp "Drücke Enter um fortzufahren..." _ || true; fi ;;
+    0) exit 0 ;;
     *)
       if [[ "$LANG_CHOICE" == "de" ]]; then echo "Ungültige Auswahl"; else echo "Invalid selection"; fi
-      sleep 1
-      ;;
+      sleep 1 ;;
   esac
 done
