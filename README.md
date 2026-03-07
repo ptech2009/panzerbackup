@@ -13,7 +13,12 @@ At startup, the script asks which language you prefer:
 * 🇬🇧 English
 * 🇩🇪 Deutsch
 
-All menus and messages are shown in the chosen language.
+All menus and messages are shown in the chosen language. You can also set the language via environment variable to skip the prompt:
+
+```bash
+LANG_CHOICE=en ./panzerbackup.sh
+LANG_CHOICE=de ./panzerbackup.sh
+```
 
 ---
 
@@ -23,81 +28,94 @@ All menus and messages are shown in the chosen language.
 * Detects system disk (NVMe, LVM, SATA, Proxmox-root)
 * Auto-detects backup target by label → any ext4 drive containing `panzerbackup` in the label (case-insensitive)
 * Example labels: `panzerbackup`, `PANZERBACKUP`, `panzerbackup-pm` (for Proxmox)
+* Override disk detection with `--disk /dev/XYZ` or `DISK_OVERRIDE` environment variable
 
-### ✅ **Named Backups** 🆕
+### ✅ **Named Backups**
 * Assign custom names to backups (e.g., `proxmox-node1`, `homeserver`)
 * Default: uses hostname automatically
 * Makes managing backups from multiple systems easy
 * Files named as: `panzer_NAME_2025-10-04_21-03-29.img.zst.gpg`
 
-### ✅ **Background Execution with Live Status** 🆕
+### ✅ **Background Execution with Live Status**
 * Backups run in background and survive SSH disconnections
+* Uses `nohup` + `setsid` for full process isolation
 * Real-time status monitoring via `./panzerbackup.sh status`
-* Live progress display with automatic log updates
+* Live progress display with automatic log updates every 2 seconds
 * Worker process continues even if your terminal closes
 
-### ✅ **Advanced Status Display** 🆕
+### ✅ **Advanced Status Display**
 * **Real-time progress monitoring** with automatic updates every 2 seconds
-* **Color-coded status indicators**:
+* **Color-coded status indicators** (in interactive terminals):
   - 🟢 Green: Successful completion
   - 🟡 Yellow: Backup/restore in progress
   - 🔴 Red: Errors or failures
-* **Live log streaming** showing the last 50 lines of backup activity
-* **Systemd integration display** showing timer and service status
+* **Live log streaming** showing the last 20 lines of backup activity (configurable via `LIVE_LOG_LINES`)
 * **Process information** with PID tracking
-* **Persistent status tracking** survives terminal disconnection
+* **Persistent status tracking** survives terminal disconnection (stored in `/run/panzerbackup/status`)
 * Access via interactive menu option 8 (Progress) or `./panzerbackup.sh status`
 
-### ✅ **Systemd Integration** 🆕
+### ✅ **Systemd Integration**
 * Native systemd service and timer support
 * Automated scheduled backups (recommended for production)
 * Integrated status display shows timer/service information
-* Perfect for unattended nightly backups with auto-reboot
+* Perfect for unattended nightly backups
+* Supports `EnvironmentFile` (`/etc/panzerbackup.env`) for clean configuration
 
 ### ✅ **Compression**
-* Uses `zstd` with multi-threading for fast and efficient backups
-* Falls back to raw image if `zstd` is not available
+* Uses `zstd` with multi-threading (`-T0`) for fast and efficient backups
+* Auto mode: uses compression if `zstd` is available, falls back to raw image otherwise
 * Automatic installation prompt if `zstd` is missing
+* Configurable compression level via `--zstd-level N` or `ZSTD_LEVEL` (default: 6, range: 1–19)
 
 ### ✅ **Optional AES-256 GPG Encryption**
 * Backups can be encrypted with a passphrase
-* Passphrase prompt with confirmation
-* Can be provided via `--passfile` for automation
+* Passphrase prompt with confirmation (interactive mode)
+* Can be provided via `--passfile` for automation (passphrase read from file)
+* Combines seamlessly with compression: `dd | zstd | gpg`
 
 ### ✅ **Integrity Verification**
-* SHA256 checksum is generated for every backup
-* Automatic verification after backup
-* Symlinks (`LATEST_OK`) always point to the last valid backup
+* SHA256 checksum is generated inline during backup (no second pass)
+* Automatic verification after backup completes
+* Symlinks (`LATEST_OK`, `LATEST_OK.sha256`, `LATEST_OK.sfdisk`) always point to the last valid backup
 * Dedicated verify mode to check existing backups
+
+### ✅ **Space Management**
+* Checks available disk space before starting backup
+* Automatically removes oldest backups if space is insufficient (`AUTO_DELETE_OLDEST=1`)
+* Configurable minimum free space reserve (`MIN_FREE_BYTES`, default: 2 GB)
+* Cleans up stale `.part` files from interrupted backups
+* Rotation: keeps the last *n* backups (default: 3, configurable via `KEEP`)
 
 ### ✅ **Proxmox VM/CT Quiesce**
 * Automatically freezes or suspends running VMs/containers
 * If QEMU Guest Agent is available: uses `fsfreeze` for clean, consistent snapshots
 * Falls back to suspend if QGA is not available
 * Containers: uses `pct freeze/unfreeze`
+* Automatic resume/unfreeze on backup completion or error
 
 ### ✅ **SSH Session Protection**
-* Backups continue even if your SSH connection is lost (e.g., network drop, client shutdown)
+* Backups continue even if your SSH connection is lost (network drop, client shutdown)
 * Uses `systemd-inhibit` to prevent system sleep/suspend during backup
-* Session disowning keeps jobs running until finished
+* Worker runs via `nohup setsid` for full session independence
 
 ### ✅ **Restore Function**
 * Restore to original disk or any alternative disk
-* Interactive disk selection mode
+* Interactive disk selection mode (`--select-disk`)
 * Includes **dry-run mode** (shows what would happen without writing)
-* Can skip or auto-repair GRUB bootloader depending on target disk
+* Automatic GRUB repair when restoring to the original system disk
+* Skips GRUB installation when restoring to a different disk
 
 ### ✅ **Post Actions**
 * After backup/restore, choose:
   * Do nothing
   * Reboot
   * Shutdown
-* Can be preset via command-line flags for automation
+* Can be preset via `--post reboot|shutdown|none` for automation
 
-### ✅ **Rotation**
-* Keeps the last *n* backups (default: 3)
-* Automatically removes older backups
-* Configurable via `KEEP` variable
+### ✅ **Stop Running Backup**
+* Gracefully stop a running backup via menu option `S` or `./panzerbackup.sh stop`
+* Sends INT → TERM → KILL signals with escalation
+* Automatically resumes/unfreezes Proxmox VMs/CTs after stop
 
 ---
 
@@ -117,24 +135,32 @@ sudo ./panzerbackup.sh
 When launched without arguments, the script shows a full interactive menu:
 
 ```
-1) Backup (auto-compression, inhibit-protection)
-2) Restore latest valid backup
-3) Restore (dry-run / test only)
-4) Backup without compression
-5) Backup with compression (zstd)
-6) Restore with disk selection
-7) Verify latest backup
-8) Show status (live progress)
-9) View log file
-S) Stop running job
+╔═══════════════════════════════════════════════╗
+║              Panzerbackup Manager             ║
+╚═══════════════════════════════════════════════╝
+
+System disk: /dev/sda
+Backup dir:  /mnt/panzerbackup
+
+STATUS: Ready
+
+1) Backup   - Start backup (auto-compression)
+2) Restore  - Restore latest valid backup
+3) Dry-Run  - Restore verify only (no write)
+4) Backup   - Without compression
+5) Backup   - With compression (zstd)
+6) Restore  - With disk selection
+7) Verify   - Verify latest backup (sha256)
+8) Progress - Show live status
+9) Log      - View log file
+S) Stop     - Stop running job
+0) Exit
 ```
 
 During backup, you will be prompted for:
-- **Backup name** (e.g., `proxmox-node1`, `homeserver`) - defaults to hostname
-- **Post-action** (reboot/shutdown/none)
+- **Backup name** (e.g., `proxmox-node1`, `homeserver`) — defaults to hostname
+- **Post-action** (reboot / shutdown / none)
 - **Encryption** (yes/no with passphrase)
-
-Everything can be configured directly in the menu – no need to remember command-line flags!
 
 ---
 
@@ -149,15 +175,15 @@ The status display provides real-time monitoring of running backups:
 - Command line: `sudo ./panzerbackup.sh status`
 
 **Features:**
-- **Real-time updates** every 2 seconds
+- **Real-time updates** every 2 seconds (configurable via `MENU_REFRESH_SECONDS`)
 - **Color-coded status** for quick visual feedback:
   - 🟢 Green: Success messages (e.g., "Backup completed successfully")
   - 🟡 Yellow: Active operations (e.g., "BACKUP: dd | zstd running...")
   - 🔴 Red: Errors or failures
-- **Live log streaming** shows last 50 lines of activity
+- **Live log streaming** shows last 20 lines of activity (configurable via `LIVE_LOG_LINES`)
 - **Process tracking** with PID information
-- **Non-blocking** - exit with CTRL+C (backup continues running!)
-- **Reconnect anytime** - even after SSH disconnect, status is preserved
+- **Non-blocking** — exit with CTRL+C (backup continues running!)
+- **Reconnect anytime** — even after SSH disconnect, status is preserved in `/run/panzerbackup/`
 
 **Example Status Output:**
 ```
@@ -169,7 +195,7 @@ CTRL+C to stop viewing (backup keeps running!)
 
 Current status: BACKUP: dd | zstd running...
 ==========================================
-Log (last 50 lines):
+Log (last 20 lines):
 ==========================================
 === 2025-12-23 14:30:15 | Starting panzer-backup...
   - VM 100: QGA ok → fsfreeze-freeze
@@ -181,27 +207,25 @@ Log (last 50 lines):
 ...
 ```
 
-### Status When No Backup Running
+### Status When No Backup Is Running
 
 If no backup is currently active:
 - Shows "No backup is currently running"
-- Displays last known status
-- Option to return to menu
+- Displays last known status from `/run/panzerbackup/status`
+- Press Enter to return to the menu
 
 ### Background Backup Workflow
 
 1. **Start backup** via menu or CLI
-2. **Backup runs in background** - you get your prompt back immediately
-3. **Monitor progress** anytime with status command
-4. **Disconnect SSH** if needed - backup continues
-5. **Reconnect later** and check status - all information preserved
-6. **Completion notification** when backup finishes
+2. **Backup runs in background** — you get your prompt back immediately
+3. **Monitor progress** anytime with `./panzerbackup.sh status`
+4. **Disconnect SSH** if needed — backup continues
+5. **Reconnect later** and check status — all information preserved
+6. **Completion notification** shown when you next check status
 
 ---
 
 ## 🤖 Command-Line Usage (Automation)
-
-For scripting and automation, you can use direct commands:
 
 ### Backup Examples
 
@@ -228,9 +252,6 @@ sudo ./panzerbackup.sh status  # Watch live progress
 ```bash
 # Watch live backup progress (updates every 2 seconds)
 sudo ./panzerbackup.sh status
-
-# Check if backup is running
-# Shows current status, logs, and systemd information
 ```
 
 ### Restore Examples
@@ -239,13 +260,13 @@ sudo ./panzerbackup.sh status
 # Interactive restore
 sudo ./panzerbackup.sh restore
 
-# Dry-run (test only)
+# Dry-run (test only, no writing)
 sudo ./panzerbackup.sh restore --dry-run
 
 # Restore to specific disk
 sudo ./panzerbackup.sh restore --target /dev/sdb
 
-# Restore with disk selection menu
+# Restore with interactive disk selection menu
 sudo ./panzerbackup.sh restore --select-disk
 ```
 
@@ -259,7 +280,7 @@ sudo ./panzerbackup.sh verify
 ### Log Viewing
 
 ```bash
-# View last 200 lines of log
+# View last 100 lines of log (default)
 sudo ./panzerbackup.sh log
 
 # View specific number of lines
@@ -272,59 +293,57 @@ sudo ./panzerbackup.sh log --file /path/to/custom.log
 ### Stop Running Backup
 
 ```bash
-# Gracefully stop a running backup
+# Gracefully stop a running backup (with confirmation prompt)
 sudo ./panzerbackup.sh stop
 ```
 
 ### Available Flags
 
 **Backup:**
-- `--name NAME` - Custom backup name (default: hostname)
-- `--compress` / `--no-compress` - Force compression on/off
-- `--zstd-level N` - Compression level 1-19 (default: 6)
-- `--encrypt` / `--no-encrypt` - Enable/disable encryption
-- `--passfile FILE` - Read passphrase from file
-- `--post reboot|shutdown|none` - Action after backup
-- `--disk /dev/XYZ` - Override system disk detection
-- `--select-backup` - Show menu if multiple backup targets found
+| Flag | Description |
+|---|---|
+| `--name NAME` | Custom backup name (default: hostname) |
+| `--compress` / `--no-compress` | Force compression on/off |
+| `--zstd-level N` | Compression level 1–19 (default: 6) |
+| `--encrypt` / `--no-encrypt` | Enable/disable GPG encryption |
+| `--passfile FILE` | Read passphrase from file |
+| `--post reboot\|shutdown\|none` | Action after backup |
+| `--disk /dev/XYZ` | Override system disk detection |
+| `--select-backup` | Show menu if multiple backup targets found |
 
 **Restore:**
-- `--dry-run` - Test restore without writing
-- `--target /dev/sdX` - Restore to specific disk
-- `--select-disk` - Show disk selection menu
-- `--post reboot|shutdown|none` - Action after restore
-- `--passfile FILE` - Read decryption passphrase from file
+| Flag | Description |
+|---|---|
+| `--dry-run` | Test restore without writing |
+| `--target /dev/sdX` | Restore to specific disk |
+| `--select-disk` | Show interactive disk selection menu |
+| `--post reboot\|shutdown\|none` | Action after restore |
+| `--passfile FILE` | Read decryption passphrase from file |
+| `--select-backup` | Show menu if multiple backup targets found |
 
 ---
 
 ## ⚙️ Systemd Integration (Recommended for Production)
 
-For scheduled, robust nightly backups (especially with reboots, network dependencies, or boot order requirements), systemd is the cleanest solution.
+For scheduled, robust nightly backups, systemd is the cleanest solution.
 
 ### A) Create Systemd Service
 
 ```bash
-# Create/replace service unit
 sudo tee /etc/systemd/system/panzerbackup.service >/dev/null <<'EOF'
 [Unit]
 Description=Panzerbackup – Automated System Backup
 After=network-online.target local-fs.target
 Wants=network-online.target
-# Ensure backup target is mounted (adjust path if needed)
 RequiresMountsFor=/mnt/panzerbackup-pm
-# Only start if script exists and is executable
 ConditionPathIsExecutable=/root/bin/panzerbackup.sh
 
 [Service]
 Type=oneshot
 User=root
 Group=root
-# Optional: separate env file for settings (BACKUP_LABEL, KEEP, etc.)
 EnvironmentFile=-/etc/panzerbackup.env
-# Provide clean PATH (including /root/bin)
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/bin
-# Optional: Set language to avoid prompts (script is non-interactive under systemd anyway)
-# Environment=LANG_CHOICE=en
 WorkingDirectory=/root/bin
 ExecStart=/root/bin/panzerbackup.sh backup --post none
 PrivateTmp=yes
@@ -335,7 +354,6 @@ TimeoutStartSec=12h
 WantedBy=multi-user.target
 EOF
 
-# Reload and enable
 sudo systemctl daemon-reload
 sudo systemctl enable panzerbackup.service
 
@@ -379,21 +397,13 @@ systemctl status panzerbackup.service
 journalctl -u panzerbackup.service -n 100 --no-pager
 ```
 
-### Live Status Monitoring
-
-Even when systemd starts the job, you can always monitor progress:
+Even when systemd starts the job, you can monitor progress anytime:
 
 ```bash
 sudo ./panzerbackup.sh status
 ```
 
-**Important:** Detailed progress remains in the dedicated log `/mnt/panzerbackup-pm/panzerbackup.log` and status tracking `/run/panzerbackup/status`.
-
-The `status` command shows:
-- Current backup status
-- Live log output (last 50 lines)
-- Systemd timer/service information (if configured)
-- Process information
+Progress details are stored in `$BACKUP_DIR/panzerbackup.log` and `/run/panzerbackup/status`.
 
 ---
 
@@ -408,12 +418,17 @@ The `status` command shows:
   * `panzerbackup-pm`
   * `Panzerbackup-2024`
 
-### Recommended Packages
-* `zstd` (for compression) - will prompt for auto-install if missing
-* `gnupg` (for encryption)
-* `lsblk`, `dd`, `sha256sum` (usually pre-installed)
+Label a drive with:
+```bash
+e2label /dev/sdX panzerbackup
+```
 
-The script will automatically check and guide you to install missing tools.
+### Required Packages
+* `lsblk`, `dd`, `sha256sum`, `sfdisk`, `blockdev` — usually pre-installed
+* `zstd` — for compression (auto-install prompt if missing)
+* `gnupg` — for encryption
+
+The script automatically checks and guides you to install missing tools.
 
 ---
 
@@ -436,25 +451,29 @@ Backups are stored with the following naming scheme:
 ```
 
 ### File Extensions
-- `.img` - Raw disk image
-- `.img.zst` - zstd compressed image
-- `.img.gpg` - GPG encrypted image
-- `.img.zst.gpg` - Compressed + encrypted image
-- `.sha256` - SHA256 checksum
-- `.sfdisk` - Partition table backup
+| Extension | Description |
+|---|---|
+| `.img` | Raw disk image |
+| `.img.zst` | zstd compressed image |
+| `.img.gpg` | GPG encrypted image |
+| `.img.zst.gpg` | Compressed + encrypted image |
+| `.sha256` | SHA256 checksum |
+| `.sfdisk` | Partition table backup |
 
 ### Runtime Files
 Located in `/run/panzerbackup/`:
-- `status` - Current operation status
-- `pid` - Worker process PID
-- `worker.sh` - Background worker script
-- `startup.log` - Worker startup messages
+| File | Description |
+|---|---|
+| `status` | Current operation status (last line) |
+| `pid` | Worker process PID |
+| `worker.sh` | Generated background worker script |
+| `startup.log` | Worker startup messages |
 
 ---
 
 ## 🔧 Configuration
 
-You can set defaults via environment variables:
+Set defaults via environment variables:
 
 ```bash
 # Custom backup label
@@ -466,7 +485,7 @@ KEEP=5 ./panzerbackup.sh backup
 # Set backup name
 BACKUP_NAME=production ./panzerbackup.sh backup
 
-# Custom compression level
+# Custom compression level (1-19, default: 6)
 ZSTD_LEVEL=9 ./panzerbackup.sh backup --compress
 
 # Override disk detection
@@ -474,6 +493,18 @@ DISK_OVERRIDE=/dev/sdb ./panzerbackup.sh backup
 
 # Set language without prompt
 LANG_CHOICE=en ./panzerbackup.sh
+
+# Live status: how many log lines to show
+LIVE_LOG_LINES=50 ./panzerbackup.sh status
+
+# How often status refreshes (seconds)
+MENU_REFRESH_SECONDS=5 ./panzerbackup.sh status
+
+# Minimum free space to require before backup (bytes, default: 2 GB)
+MIN_FREE_BYTES=4294967296 ./panzerbackup.sh backup
+
+# Disable automatic deletion of old backups on low space
+AUTO_DELETE_OLDEST=0 ./panzerbackup.sh backup
 ```
 
 ### Environment File for Systemd
@@ -494,11 +525,11 @@ LANG_CHOICE=en
 
 ### Home Lab / Proxmox
 ```bash
-# Monthly full backup of Proxmox host
+# Full backup of Proxmox host with compression and encryption
 sudo ./panzerbackup.sh backup --name pve-main --compress --encrypt --post shutdown
 ```
 
-### Multiple Servers
+### Multiple Servers on One Backup Drive
 ```bash
 # Server 1
 sudo ./panzerbackup.sh backup --name web-server --compress
@@ -506,17 +537,18 @@ sudo ./panzerbackup.sh backup --name web-server --compress
 # Server 2
 sudo ./panzerbackup.sh backup --name db-server --compress
 
-# All backups stored on same external drive, easily distinguishable
+# All backups stored on same external drive, easily distinguishable by name
 ```
 
-### Automated Backups (Systemd Timer - Recommended)
+### Automated Backups (Systemd Timer — Recommended)
 ```bash
 # Set up systemd service + timer as shown above
 # Configure via /etc/panzerbackup.env
-# Monitor with: sudo ./panzerbackup.sh status
+# Monitor with:
+sudo ./panzerbackup.sh status
 ```
 
-### Automated Backups (Legacy Cronjob)
+### Automated Backups (Cronjob — Legacy)
 ```bash
 # /etc/cron.monthly/panzerbackup
 #!/bin/bash
@@ -533,25 +565,14 @@ BACKUP_NAME=prod-$(hostname -s) /path/to/panzerbackup.sh backup \
 sudo ./panzerbackup.sh restore --select-disk
 ```
 
-### Monitoring Running Backups
-```bash
-# Start backup in background
-sudo ./panzerbackup.sh backup --name production --compress
-
-# Monitor progress from another terminal (or after SSH reconnect)
-sudo ./panzerbackup.sh status
-
-# Exit monitoring with CTRL+C (backup continues!)
-```
-
 ### Remote Monitoring via SSH
 ```bash
 # Start backup on remote server
 ssh root@server 'cd /root/panzerbackup && ./panzerbackup.sh backup --name prod --compress'
 
-# Disconnect SSH - backup continues
+# Disconnect SSH — backup continues
 
-# Later: Reconnect and check status
+# Reconnect later and check status
 ssh root@server '/root/panzerbackup/panzerbackup.sh status'
 ```
 
@@ -559,7 +580,7 @@ ssh root@server '/root/panzerbackup/panzerbackup.sh status'
 
 ## 📄 License
 
-This project is licensed under the MIT License – see the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
 
 ---
 
@@ -577,44 +598,12 @@ Every bit of feedback helps make Panzerbackup even more robust.
 * Designed as a **"fire & forget" backup solution**
 * Provides consistent backups even while the system is running
 * Can restore to new hardware without hassle
-* Backups stay running even if your SSH session is interrupted
+* Backups keep running even if your SSH session is interrupted
 * Named backups make managing multiple systems easy
 * **Live status monitoring** shows real-time progress and logs
 * **Systemd integration** enables professional scheduled backups
+* Colors are only shown in interactive terminals (`-t 1` check), safe for systemd/cron logs
 
 ---
 
-## 🆕 What's New in This Version
-
-- **Named Backups**: Assign custom names to distinguish backups from different systems
-- **Background Execution**: Backups run in background and survive SSH disconnections
-- **Live Status Monitoring**: Real-time progress tracking with `./panzerbackup.sh status`
-  - Color-coded status indicators (green/yellow/red)
-  - Live log streaming (last 50 lines)
-  - Process tracking with PID information
-  - Persistent status across terminal sessions
-- **Enhanced Log Viewing**: View logs with customizable line count via menu or CLI
-- **Stop Command**: Gracefully stop running backups with `./panzerbackup.sh stop`
-- **Systemd Integration**: Native service and timer support for automated scheduling
-- **Enhanced Status Display**: Shows running backups, logs, and systemd information
-- **Improved Robustness**: Worker process isolation and error handling
-- **Better CLI**: `--name` flag for automation and environment variable support
-- **Production-Ready**: Perfect for unattended operations with automatic recovery
-
----
-
-## 🔄 Migration from Previous Versions
-
-If you're upgrading from an older version:
-
-1. **No breaking changes** - all existing backups remain compatible
-2. **New status command** - use `./panzerbackup.sh status` to monitor backups
-3. **New log command** - use `./panzerbackup.sh log` for quick log viewing
-4. **New stop command** - use `./panzerbackup.sh stop` to gracefully stop running backups
-5. **Optional systemd setup** - recommended for scheduled backups (see above)
-6. **Named backups** - now prompted during interactive backup or via `--name` flag
-7. **Runtime directory** - status files now in `/run/panzerbackup/` (automatically created)
-
----
-
-**Made with ❤️ for system administrators who value reliability.**
+**Made with ❤️ for reliable backups.**
