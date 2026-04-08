@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+VERSION="2.6"
+
 # =====[ Sane defaults for env -i + set -u ]===================================
 : "${LC_ALL:=C}"; export LC_ALL
 : "${LANG:=C}";   export LANG
@@ -60,8 +62,25 @@ STATUS_FILE="${STATUS_FILE:-$RUN_DIR/status}"
 PID_FILE="${PID_FILE:-$RUN_DIR/pid}"
 STARTUP_LOG="${STARTUP_LOG:-$RUN_DIR/startup.log}"
 WORKER_SCRIPT="${WORKER_SCRIPT:-$RUN_DIR/worker.sh}"
+START_TS_FILE="${START_TS_FILE:-$RUN_DIR/start_ts}"
 
 set_status() { echo "$1" > "$STATUS_FILE"; }
+mark_run_started() { date +%s > "$START_TS_FILE"; }
+get_elapsed_seconds() {
+  if [[ -f "$START_TS_FILE" ]]; then
+    local now start
+    now="$(date +%s)"
+    start="$(cat "$START_TS_FILE" 2>/dev/null || true)"
+    [[ "$start" =~ ^[0-9]+$ ]] || return 1
+    echo $(( now - start ))
+    return 0
+  fi
+  return 1
+}
+format_elapsed() {
+  local sec="${1:-0}"
+  printf '%02d:%02d:%02d' $((sec/3600)) $(((sec%3600)/60)) $((sec%60))
+}
 get_status() {
   if [[ -s "$STATUS_FILE" ]]; then
     tail -n1 "$STATUS_FILE"
@@ -81,7 +100,7 @@ get_status_formatted() {
     echo "$s"
   fi
 }
-clear_status_for_new_run() { : > "$STATUS_FILE"; }
+clear_status_for_new_run() { : > "$STATUS_FILE"; rm -f "$START_TS_FILE"; }
 
 is_running() {
   [[ -f "$PID_FILE" ]] || return 1
@@ -108,6 +127,43 @@ run_inhibited() {
   else
     "$@"
   fi
+}
+
+# =====================[ Live / Source Detection ]=============================
+detect_live_environment() {
+  local fstype src
+  fstype="$(findmnt -no FSTYPE / 2>/dev/null || true)"
+  src="$(findmnt -no SOURCE / 2>/dev/null || true)"
+  [[ "$fstype" =~ ^(overlay|squashfs|aufs)$ ]] && return 0
+  [[ "$src" =~ (^overlay$|^/dev/loop|casper|live) ]] && return 0
+  [[ -d /run/live/medium || -d /cdrom || -f /usr/lib/live/config/0000-root ]] && return 0
+  return 1
+}
+
+get_mount_backing_disk() {
+  local mp="${1:?}"
+  local src cur typ pk
+  src="$(findmnt -no SOURCE --target "$mp" 2>/dev/null || true)"
+  [[ -n "$src" ]] || return 1
+
+  if [[ "$src" =~ ^/dev/ && -b "$src" ]]; then
+    cur="$src"
+  elif [[ -e "/dev/mapper/$src" ]]; then
+    cur="/dev/mapper/$src"
+  elif [[ -e "/dev/$src" ]]; then
+    cur="/dev/$src"
+  else
+    return 1
+  fi
+
+  for _ in {1..16}; do
+    typ="$(lsblk -rno TYPE "$cur" 2>/dev/null || true)"
+    [[ "$typ" == "disk" ]] && { echo "$cur"; return 0; }
+    pk="$(lsblk -rno PKNAME "$cur" 2>/dev/null || true)"
+    [[ -n "$pk" ]] || break
+    cur="/dev/$pk"
+  done
+  return 1
 }
 
 # =====================[ Systemdisk-Erkennung ]================================
@@ -156,7 +212,7 @@ detect_system_disk() {
 list_available_disks() {
   need_cmd lsblk
   lsblk -dnpo NAME,SIZE,MODEL,TYPE | while IFS= read -r line; do
-    if [[ "$line" =~ disk$ ]] && [[ ! "$line" =~ ^/dev/(loop|sr) ]]; then
+    if [[ "$line" =~ disk$ ]] && [[ ! "$line" =~ ^/dev/(loop|sr|ram) ]]; then
       local name size model
       name=$(echo "$line" | awk '{print $1}')
       size=$(echo "$line" | awk '{print $2}')
@@ -167,42 +223,63 @@ list_available_disks() {
   done
 }
 
+disk_is_protected() {
+  local disk="$1" item
+  for item in ${PROTECTED_DISKS:-}; do
+    [[ "$disk" == "$item" ]] && return 0
+  done
+  return 1
+}
+
 select_target_disk() {
   local current_disk="${1:-}"
   local disks=()
-  msg "[*] Verfügbare Disks:" "[*] Available disks:"
+  if [[ "${LIVE_ENV:-0}" -eq 1 ]]; then
+    msg "[*] Live-System erkannt – Restore nur auf interne Offline-Zieldisk erlaubt" "[*] Live system detected – restore allowed only to an internal offline target disk" >&2
+    echo >&2
+  fi
+  msg "[*] Verfügbare Disks:" "[*] Available disks:" >&2
   local i=1
   while IFS='|' read -r name size model; do
-    if [[ "$name" == "$current_disk" ]]; then
-      M "  $i) $name ($size) - $model [AKTUELL SYSTEM-DISK]" \
-        "  $i) $name ($size) - $model [CURRENT SYSTEM DISK]"
+    local mark=""
+    if [[ -n "$current_disk" && "$name" == "$current_disk" ]]; then
+      mark="[AKTUELL SYSTEM-DISK / CURRENT SYSTEM DISK]"
+    fi
+    if [[ -n "${SCRIPT_SOURCE_DISK:-}" && "$name" == "$SCRIPT_SOURCE_DISK" ]]; then
+      mark="${mark:+$mark }[SKRIPT LÄUFT VON DIESER DISK / SCRIPT RUNS FROM THIS DISK]"
+    fi
+    if disk_is_protected "$name"; then
+      mark="${mark:+$mark }[GESCHÜTZT / PROTECTED]"
+    fi
+    if [[ -n "$mark" ]]; then
+      echo "  $i) $name ($size) - $model $mark" >&2
     else
-      echo "  $i) $name ($size) - $model"
+      echo "  $i) $name ($size) - $model" >&2
     fi
     disks+=("$name"); ((i++))
   done < <(list_available_disks)
   (( ${#disks[@]} > 0 )) || die "Keine geeigneten Disks gefunden" "No suitable disks found"
 
-  if (( ${#disks[@]} == 1 )); then
-    M "[*] Nur eine Disk verfügbar: ${disks[0]}" "[*] Only one disk available: ${disks[0]}"
-    echo "${disks[0]}"
-    return 0
-  fi
-
-  echo
+  echo >&2
   if [[ "$LANG_CHOICE" == "de" ]]; then
-    read -rp "Ziel-Disk auswählen (1-${#disks[@]}): " choice
+    read -r -p "Ziel-Disk auswählen (1-${#disks[@]}): " choice </dev/tty >/dev/tty
   else
-    read -rp "Select target disk (1-${#disks[@]}): " choice
+    read -r -p "Select target disk (1-${#disks[@]}): " choice </dev/tty >/dev/tty
   fi
   [[ "$choice" =~ ^[0-9]+$ ]] && (( choice>=1 && choice<=${#disks[@]} )) || die "Ungültige Auswahl: $choice" "Invalid selection: $choice"
 
   local selected="${disks[$((choice-1))]}"
-  if [[ "$selected" == "$current_disk" ]]; then
-    M "⚠️  Du hast die aktuelle System-Disk ausgewählt!" "⚠️  You selected the current system disk!"
-    ASK "Bist du sicher, dass du das System überschreiben willst?" "Are you sure you want to overwrite the system?" || die "Abgebrochen" "Aborted"
+  if [[ -n "${SCRIPT_SOURCE_DISK:-}" && "$selected" == "$SCRIPT_SOURCE_DISK" ]]; then
+    die "Restore auf $selected ist gesperrt: Das Skript läuft von dieser Disk. Bitte von Live-USB oder anderem Medium booten." "Restore to $selected is blocked: the script is running from this disk. Please boot from live USB or another medium."
   fi
-  echo "$selected"
+  if disk_is_protected "$selected"; then
+    die "Die gewählte Disk ist geschützt (Live-USB oder Backup-Medium): $selected" "The selected disk is protected (live USB or backup medium): $selected"
+  fi
+  if [[ -n "$current_disk" && "$selected" == "$current_disk" ]]; then
+    die "Restore auf $selected ist gesperrt: Das aktuell laufende System verwendet diese Disk. Bitte offline von Live-USB booten und erneut versuchen." "Restore to $selected is blocked: the currently running system uses this disk. Please boot offline from live USB and try again."
+  fi
+  printf '%s
+' "$selected"
 }
 
 # =====================[ Backup-Ziel ]=========================================
@@ -287,6 +364,38 @@ prompt_backup_name() {
 }
 
 # =====================[ Latest Backup Finder ]================================
+list_candidate_backups() {
+  local dir="${1:?}"
+  ls -1t \
+    "$dir"/panzer_*.img.zst.gpg "$dir"/panzer_*.img.gpg \
+    "$dir"/panzer_*.img.zst "$dir"/panzer_*.img 2>/dev/null || true
+}
+
+select_backup_file() {
+  local dir="${1:?}"
+  local backups=()
+  local i=1
+  mapfile -t backups < <(list_candidate_backups "$dir")
+  (( ${#backups[@]} > 0 )) || die "Keine Backup-Dateien gefunden" "No backup files found"
+
+  msg "[*] Verfügbare Backup-Dateien:" "[*] Available backup files:" >&2
+  for b in "${backups[@]}"; do
+    local tag=""
+    [[ -f "${b}.sha256" ]] && tag="[sha256]"
+    echo "  $i) $(basename "$b") $tag" >&2
+    ((i++))
+  done
+  echo >&2
+  if [[ "$LANG_CHOICE" == "de" ]]; then
+    read -r -p "Backup auswählen (1-${#backups[@]}): " choice </dev/tty >/dev/tty
+  else
+    read -r -p "Select backup (1-${#backups[@]}): " choice </dev/tty >/dev/tty
+  fi
+  [[ "$choice" =~ ^[0-9]+$ ]] && (( choice>=1 && choice<=${#backups[@]} )) || die "Ungültige Auswahl: $choice" "Invalid selection: $choice"
+  printf '%s
+' "${backups[$((choice-1))]}"
+}
+
 find_latest_valid() {
   local dir="${1:?}"
   if [[ -L "$dir/LATEST_OK" ]]; then
@@ -452,11 +561,28 @@ cleanup_oldest_backups_until_enough_space() {
 
 # =====================[ Defaults ]============================================
 BACKUP_LABEL="${BACKUP_LABEL:-PANZERBACKUP}"
+LIVE_ENV=0
+LIVE_ROOT_DISK=""
+if detect_live_environment; then
+  LIVE_ENV=1
+  LIVE_ROOT_DISK="$(get_mount_backing_disk / 2>/dev/null || true)"
+fi
+
+SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+SCRIPT_SOURCE_DISK="$(get_mount_backing_disk "$SCRIPT_PATH" 2>/dev/null || true)"
+
 DISK="${DISK_OVERRIDE:-$(detect_system_disk || true)}"
-[[ -b "${DISK:-}" ]] || die "Konnte Systemdisk nicht ermitteln" "Could not determine system disk"
+if [[ -z "${DISK:-}" && "$LIVE_ENV" -eq 0 ]]; then
+  die "Konnte Systemdisk nicht ermitteln" "Could not determine system disk"
+fi
+
+RUNNING_SYSTEM_DISK="${LIVE_ROOT_DISK:-${DISK:-}}"
 
 BACKUP_DIR="$(detect_backup_dir "$BACKUP_LABEL" || true)"
 [[ -d "${BACKUP_DIR:-}" && -w "${BACKUP_DIR:-}" ]] || die "Backup-Platte mit Label $BACKUP_LABEL nicht gefunden/ nicht schreibbar" "Backup drive with label $BACKUP_LABEL not found / not writable"
+
+BACKUP_DISK="$(get_mount_backing_disk "$BACKUP_DIR" 2>/dev/null || true)"
+PROTECTED_DISKS="${BACKUP_DISK:-} ${LIVE_ROOT_DISK:-} ${SCRIPT_SOURCE_DISK:-}"
 
 KEEP="${KEEP:-3}"
 MIN_FREE_BYTES="${MIN_FREE_BYTES:-2147483648}"
@@ -479,6 +605,14 @@ FINAL_FILE=""
 TEMP_FILE=""
 TEMP_SHA=""
 LOG_FILE_DEFAULT="${BACKUP_DIR}/panzerbackup.log"
+
+if [[ "$LIVE_ENV" -eq 1 ]]; then
+  msg "[*] Live-System erkannt. Restore-Zieldisk wird nicht automatisch aus / ermittelt." "[*] Live system detected. Restore target disk will not be auto-detected from /."
+  [[ -n "${LIVE_ROOT_DISK:-}" ]] && msg "[*] Live-USB geschützt: $LIVE_ROOT_DISK" "[*] Live USB protected: $LIVE_ROOT_DISK"
+  [[ -n "${BACKUP_DISK:-}" ]] && msg "[*] Backup-Medium geschützt: $BACKUP_DISK" "[*] Backup medium protected: $BACKUP_DISK"
+fi
+[[ -n "${RUNNING_SYSTEM_DISK:-}" ]] && msg "[*] Laufende System-Disk: $RUNNING_SYSTEM_DISK" "[*] Running system disk: $RUNNING_SYSTEM_DISK"
+[[ -n "${SCRIPT_SOURCE_DISK:-}" ]] && msg "[*] Skript-Quelle geschützt: $SCRIPT_SOURCE_DISK" "[*] Script source disk protected: $SCRIPT_SOURCE_DISK"
 
 # =====================[ Prompts ]============================================
 prompt_post_action() {
@@ -655,6 +789,8 @@ do_backup_background() {
   cat > "$WORKER_SCRIPT" << 'EOFWORKER'
 #!/usr/bin/env bash
 set -euo pipefail
+
+VERSION="2.6"
 set -E
 trap 'rc=$?; if [[ "${LANG_CHOICE:-de}" == "de" ]]; then set_status "FEHLER: Backup abgebrochen (RC=$rc)"; else set_status "ERROR: Backup aborted (RC=$rc)"; fi; echo "ERROR (Backup Worker) line $LINENO: $BASH_COMMAND (RC=$rc)"; exit $rc' ERR
 
@@ -950,6 +1086,7 @@ do_backup() {
   cleanup_oldest_backups_until_enough_space
 
   clear_status_for_new_run
+  mark_run_started
   msg "" ""
   msg "Starte Backup im Hintergrund..." "Starting backup in background..."
 
@@ -1001,30 +1138,48 @@ do_verify() {
 # =====================[ Restore ]=============================================
 do_restore() {
   need_cmd dd; need_cmd sha256sum; need_cmd lsblk; need_cmd mount; need_cmd chroot
-  local restore_disk="${DISK}"
+  local restore_disk="${DISK:-}"
   if [[ -n "${TARGET_DISK:-}" ]]; then
     restore_disk="$TARGET_DISK"; [[ -b "$restore_disk" ]] || die "Angegebene Ziel-Disk nicht gefunden: $restore_disk" "Target disk not found: $restore_disk"
-  elif [[ "${SELECT_DISK:-}" == "true" ]]; then
-    restore_disk="$(select_target_disk "$DISK")"
+  elif [[ "${SELECT_DISK:-}" == "true" || "$LIVE_ENV" -eq 1 || -z "$restore_disk" ]]; then
+    restore_disk="$(select_target_disk "${RUNNING_SYSTEM_DISK:-}")"
   fi
+  [[ -b "$restore_disk" ]] || die "Keine gültige Restore-Zieldisk gewählt" "No valid restore target disk selected"
+  if disk_is_protected "$restore_disk"; then
+    die "Restore-Ziel ist geschützt (Live-USB, Backup-Medium oder Skript-Quelle): $restore_disk" "Restore target is protected (live USB, backup medium or script source): $restore_disk"
+  fi
+
+  clear_status_for_new_run
+  mark_run_started
+  set_status "$( [[ "$LANG_CHOICE" == "de" ]] && echo "RESTORE: Initialisiere..." || echo "RESTORE: Initializing..." )"
 
   msg "=== $(date) | Starte Restore ${RESTORE_DRY_RUN:+(Dry-Run)} auf $restore_disk ===" \
       "=== $(date) | Starting restore ${RESTORE_DRY_RUN:+(dry-run)} to $restore_disk ==="
 
   local CANDIDATE
-  CANDIDATE="$(find_latest_valid "$BACKUP_DIR" || true)" || die "Kein gültiges Backup gefunden" "No valid backup found"
+  if [[ "${SELECT_BACKUP:-}" == "true" ]]; then
+    CANDIDATE="$(select_backup_file "$BACKUP_DIR")"
+  else
+    CANDIDATE="$(find_latest_valid "$BACKUP_DIR" || true)"
+  fi
+  [[ -n "${CANDIDATE:-}" && -f "$CANDIDATE" ]] || die "Kein gültiges Backup gefunden" "No valid backup found"
   msg "[✓] Verwende: $(basename "$CANDIDATE")" "[✓] Using: $(basename "$CANDIDATE")"
+  set_status "$( [[ "$LANG_CHOICE" == "de" ]] && echo "RESTORE: Verwende $(basename "$CANDIDATE")" || echo "RESTORE: Using $(basename "$CANDIDATE")" )"
 
   if [[ "$RESTORE_DRY_RUN" == "--dry-run" ]]; then
+    set_status "$( [[ "$LANG_CHOICE" == "de" ]] && echo "RESTORE: Dry-Run abgeschlossen" || echo "RESTORE: Dry-run completed" )"
     msg "[DRY-RUN] Würde $(basename "$CANDIDATE") auf $restore_disk schreiben." \
         "[DRY-RUN] Would write $(basename "$CANDIDATE") to $restore_disk."
     return 0
   fi
 
   M "⚠️  ALLE DATEN auf $restore_disk werden überschrieben!" "⚠️  ALL DATA on $restore_disk will be overwritten!"
-  ASK "Willst du das Restore wirklich starten?" "Do you really want to start the restore?" || { msg "Abbruch." "Aborted."; return 3; }
+  ASK "Willst du das Restore wirklich starten?" "Do you really want to start the restore?" || { set_status "$( [[ "$LANG_CHOICE" == "de" ]] && echo "RESTORE: Abgebrochen" || echo "RESTORE: Aborted" )"; msg "Abbruch." "Aborted."; return 3; }
 
   set -o pipefail
+  set_status "$( [[ "$LANG_CHOICE" == "de" ]] && echo "RESTORE: Prüfe Checksumme..." || echo "RESTORE: Verifying checksum..." )"
+  ( cd "$BACKUP_DIR" && sha256sum -c "$(basename "$CANDIDATE").sha256" >/dev/null ) || die "Checksum-Verify fehlgeschlagen: $(basename "$CANDIDATE")" "Checksum verification failed: $(basename "$CANDIDATE")"
+
   if [[ "$CANDIDATE" == *.gpg ]]; then
     need_cmd gpg
     if [[ -z "${ENCRYPT_PASSPHRASE:-}" ]]; then
@@ -1036,12 +1191,14 @@ do_restore() {
     fi
     if [[ "$CANDIDATE" == *.zst.gpg ]]; then
       msg "[*] gpg -d | zstd -d | dd …" "[*] gpg -d | zstd -d | dd …"
+      set_status "$( [[ "$LANG_CHOICE" == "de" ]] && echo "RESTORE: gpg | zstd | dd läuft..." || echo "RESTORE: gpg | zstd | dd running..." )"
       run_inhibited "Panzer-RESTORE läuft / running" bash -c \
         'gpg --batch --yes --decrypt --pinentry-mode loopback --passphrase-fd 3 3<<<"'"$ENCRYPT_PASSPHRASE"'" "'"$CANDIDATE"'" \
          | zstd -d -q \
          | dd of="'"$restore_disk"'" bs=64M status=progress conv=fsync'
     else
       msg "[*] gpg -d | dd …" "[*] gpg -d | dd …"
+      set_status "$( [[ "$LANG_CHOICE" == "de" ]] && echo "RESTORE: gpg | dd läuft..." || echo "RESTORE: gpg | dd running..." )"
       run_inhibited "Panzer-RESTORE läuft / running" bash -c \
         'gpg --batch --yes --decrypt --pinentry-mode loopback --passphrase-fd 3 3<<<"'"$ENCRYPT_PASSPHRASE"'" "'"$CANDIDATE"'" \
          | dd of="'"$restore_disk"'" bs=64M status=progress conv=fsync'
@@ -1050,16 +1207,18 @@ do_restore() {
   elif [[ "$CANDIDATE" == *.zst ]]; then
     need_cmd zstd
     msg "[*] zstd -d | dd …" "[*] zstd -d | dd …"
+    set_status "$( [[ "$LANG_CHOICE" == "de" ]] && echo "RESTORE: zstd | dd läuft..." || echo "RESTORE: zstd | dd running..." )"
     run_inhibited "Panzer-RESTORE läuft / running" bash -c \
       'zstd -d -q "'"$CANDIDATE"'" \
        | dd of="'"$restore_disk"'" bs=64M status=progress conv=fsync'
   else
     msg "[*] dd (roh) …" "[*] dd (raw) …"
+    set_status "$( [[ "$LANG_CHOICE" == "de" ]] && echo "RESTORE: dd läuft..." || echo "RESTORE: dd running..." )"
     run_inhibited "Panzer-RESTORE läuft / running" dd if="$CANDIDATE" of="$restore_disk" bs=64M status=progress conv=fsync
   fi
   set +o pipefail
 
-  if [[ "$restore_disk" == "$DISK" ]]; then
+  if [[ -n "${DISK:-}" && "$restore_disk" == "$DISK" && "$LIVE_ENV" -eq 0 ]]; then
     msg "[*] Versuche GRUB zu erneuern …" "[*] Attempting GRUB repair …"
     local ROOT_CAND
     ROOT_CAND="$(lsblk -lnpo NAME,TYPE | awk '/lvm/ && /root/{print $1; exit}' || true)"
@@ -1084,7 +1243,9 @@ do_restore() {
     msg "[*] Restore auf anderer Disk – GRUB-Installation übersprungen." "[*] Restore to different disk – skipping GRUB installation."
   fi
 
+  set_status "$( [[ "$LANG_CHOICE" == "de" ]] && echo "RESTORE: Finalisiere..." || echo "RESTORE: Finalizing..." )"
   msg "[✓] Restore abgeschlossen." "[✓] Restore completed."
+  set_status "$( [[ "$LANG_CHOICE" == "de" ]] && echo "RESTORE: Erfolgreich abgeschlossen" || echo "RESTORE: Completed successfully" )"
   post_action_maybe "restore"
 }
 
@@ -1162,6 +1323,9 @@ show_status() {
     fi
     echo ""
     msg "Aktueller Status: $(get_status_formatted)" "Current status: $(get_status_formatted)"
+    if elapsed="$(get_elapsed_seconds 2>/dev/null)"; then
+      msg "Laufzeit: $(format_elapsed "$elapsed")" "Elapsed: $(format_elapsed "$elapsed")"
+    fi
     echo "=========================================="
     msg "Log (letzte ${LIVE_LOG_LINES} Zeilen):" "Log (last ${LIVE_LOG_LINES} lines):"
     echo "=========================================="
@@ -1190,12 +1354,28 @@ show_status() {
 
 # =====================[ Menu ]===============================================
 show_menu() {
-  { clear 2>/dev/null || printf '\033c'; } || true
-  echo ""
-  echo "╔═══════════════════════════════════════════════╗"
-  echo "║              Panzerbackup Manager             ║"
-  echo "╚═══════════════════════════════════════════════╝"
-  echo ""
+  { clear 2>/dev/null || printf 'c'; } || true
+  local banner_title="▄▅▆ Panzerbackup Manager v${VERSION} ▆▅▄"
+  local cols banner_inner title_len pad_left pad_right display_slack
+  cols="${COLUMNS:-$(tput cols 2>/dev/null || echo 80)}"
+  [[ "$cols" =~ ^[0-9]+$ ]] || cols=80
+  title_len=${#banner_title}
+  display_slack=4
+  banner_inner=$(( title_len + 14 + display_slack ))
+  (( banner_inner > cols - 6 )) && banner_inner=$(( cols - 6 ))
+  (( banner_inner < title_len + 10 + display_slack )) && banner_inner=$(( title_len + 10 + display_slack ))
+  pad_left=$(( (banner_inner - title_len) / 2 ))
+  pad_right=$(( banner_inner - title_len - pad_left ))
+  printf '
+'
+  printf '╔%*s╗
+' "$banner_inner" '' | tr ' ' '═'
+  printf '║%*s%s%*s║
+' "$pad_left" '' "$banner_title" "$pad_right" ''
+  printf '╚%*s╝
+' "$banner_inner" '' | tr ' ' '═'
+  printf '
+'
   if [[ "$LANG_CHOICE" == "de" ]]; then
     echo "Systemdisk:  ${DISK}"
     echo "Backup-Ziel: ${BACKUP_DIR}"
@@ -1212,6 +1392,13 @@ show_menu() {
       echo "${Y}STATUS: Operation running!${NC}"
     fi
     echo "        $(get_status_formatted)"
+    if elapsed="$(get_elapsed_seconds 2>/dev/null)"; then
+      if [[ "$LANG_CHOICE" == "de" ]]; then
+        echo "        Laufzeit: $(format_elapsed "$elapsed")"
+      else
+        echo "        Elapsed: $(format_elapsed "$elapsed")"
+      fi
+    fi
   else
     if [[ "$LANG_CHOICE" == "de" ]]; then
       echo "${G}STATUS: Bereit${NC}"
@@ -1262,8 +1449,9 @@ print_usage() {
   if [[ "$LANG_CHOICE" == "de" ]]; then
 cat <<USAGE
 Erkannt:
-  Systemdisk:  $DISK
+  Systemdisk:  ${DISK:-<live/bitte wählen>}
   Backup-Ziel: $BACKUP_DIR
+  Live-System: $([[ "$LIVE_ENV" -eq 1 ]] && echo ja || echo nein)
 
 Aufruf:
   $0 backup  [--name NAME] [--compress|--no-compress] [--zstd-level N] [--encrypt|--no-encrypt] [--passfile FILE] [--post reboot|shutdown|none] [--select-backup] [--disk /dev/XYZ]
@@ -1285,8 +1473,9 @@ USAGE
   else
 cat <<USAGE
 Detected:
-  System disk:  $DISK
+  System disk:  ${DISK:-<live/select manually>}
   Backup dir:   $BACKUP_DIR
+  Live system:  $([[ "$LIVE_ENV" -eq 1 ]] && echo yes || echo no)
 
 Usage:
   $0 backup  [--name NAME] [--compress|--no-compress] [--zstd-level N] [--encrypt|--no-encrypt] [--passfile FILE] [--post reboot|shutdown|none] [--select-backup] [--disk /dev/XYZ]
@@ -1312,14 +1501,14 @@ USAGE
 if [[ $# -gt 0 ]]; then
   case "$1" in
     backup)
-      shift; REMAINS=($(parse_backup_flags "$@"))
+      shift; parse_backup_flags "$@" >/dev/null
       if [[ -t 0 && -t 1 ]]; then
         [[ -z "${POST_ACTION_PRESET:-}" ]] && prompt_post_action "Backup"
         if [[ "${ENCRYPT_MODE}" == "off" && -z "${ENCRYPT_PASSPHRASE:-}" ]]; then prompt_encryption; fi
       fi
       do_backup ;;
     restore)
-      shift; REMAINS=($(parse_restore_flags "$@"))
+      shift; parse_restore_flags "$@" >/dev/null
       if [[ -t 0 && -t 1 && -z "${POST_ACTION_PRESET:-}" ]]; then
         prompt_post_action "Restore"
       fi
