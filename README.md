@@ -30,6 +30,14 @@ LANG_CHOICE=de ./panzerbackup.sh
 * Example labels: `panzerbackup`, `PANZERBACKUP`, `panzerbackup-pm` (for Proxmox)
 * Override disk detection with `--disk /dev/XYZ` or `DISK_OVERRIDE` environment variable
 
+### ✅ **Disk Protection**
+* The script automatically blocks unsafe restore targets to prevent accidental data loss:
+  * The **live USB** the script is running from
+  * The **backup medium** itself
+  * The **disk the script file is stored on** (script source disk)
+* All three are detected automatically and marked as `[PROTECTED]` in the disk selection menu
+* Attempting to restore to a protected disk results in a clear error message
+
 ### ✅ **Named Backups**
 * Assign custom names to backups (e.g., `proxmox-node1`, `homeserver`)
 * Default: uses hostname automatically
@@ -45,6 +53,7 @@ LANG_CHOICE=de ./panzerbackup.sh
 
 ### ✅ **Advanced Status Display**
 * **Real-time progress monitoring** with automatic updates every 2 seconds
+* **Elapsed time display** shown during active backup/restore operations
 * **Color-coded status indicators** (in interactive terminals):
   - 🟢 Green: Successful completion
   - 🟡 Yellow: Backup/restore in progress
@@ -68,10 +77,11 @@ LANG_CHOICE=de ./panzerbackup.sh
 * Configurable compression level via `--zstd-level N` or `ZSTD_LEVEL` (default: 6, range: 1–19)
 
 ### ✅ **Optional AES-256 GPG Encryption**
-* Backups can be encrypted with a passphrase
-* Passphrase prompt with confirmation (interactive mode)
+* Backups can be encrypted with a passphrase (GnuPG symmetric, AES-256)
+* Interactive passphrase prompt with confirmation (typo-safe double entry)
 * Can be provided via `--passfile` for automation (passphrase read from file)
 * Combines seamlessly with compression: `dd | zstd | gpg`
+* Restore automatically detects encrypted backups and prompts for the passphrase
 
 ### ✅ **Integrity Verification**
 * SHA256 checksum is generated inline during backup
@@ -102,9 +112,11 @@ LANG_CHOICE=de ./panzerbackup.sh
 ### ✅ **Restore Function**
 * Restore to original disk or any alternative disk
 * Interactive disk selection mode (`--select-disk`)
+* Manual backup file selection via `--select-backup` (interactive list of all available backups)
 * Includes **dry-run mode** (shows what would happen without writing)
 * Automatic GRUB repair when restoring to the original system disk
 * Skips GRUB installation when restoring to a different disk
+* Restore pipeline automatically adapts to backup format (`gpg -d | zstd -d | dd` etc.)
 
 ### ✅ **Post Actions**
 * After backup/restore, choose:
@@ -136,9 +148,9 @@ sudo ./panzerbackup.sh
 When launched without arguments, the script shows a full interactive menu:
 
 ```
-╔═══════════════════════════════════════════════╗
-║              Panzerbackup Manager             ║
-╚═══════════════════════════════════════════════╝
+╔═══════════════════════════════════════════════════╗
+║        ▄▅▆ Panzerbackup Manager v2.6 ▆▅▄          ║
+╚═══════════════════════════════════════════════════╝
 
 System disk: /dev/sda
 Backup dir:  /mnt/panzerbackup
@@ -161,7 +173,7 @@ S) Stop     - Stop running job
 During backup, you will be prompted for:
 - **Backup name** (e.g., `proxmox-node1`, `homeserver`) — defaults to hostname
 - **Post-action** (reboot / shutdown / none)
-- **Encryption** (yes/no with passphrase)
+- **Encryption** (yes/no, with passphrase confirmation if yes)
 
 ---
 
@@ -177,6 +189,7 @@ The status display provides real-time monitoring of running backups:
 
 **Features:**
 - **Real-time updates** every 2 seconds (configurable via `MENU_REFRESH_SECONDS`)
+- **Elapsed time** shown as `HH:MM:SS` during active operations
 - **Color-coded status** for quick visual feedback:
   - 🟢 Green: Success messages (e.g., "Backup completed successfully")
   - 🟡 Yellow: Active operations (e.g., "BACKUP: dd | zstd running...")
@@ -195,6 +208,7 @@ The status display provides real-time monitoring of running backups:
 CTRL+C to stop viewing (backup keeps running!)
 
 Current status: BACKUP: dd | zstd running...
+Elapsed: 00:12:34
 ==========================================
 Log (last 20 lines):
 ==========================================
@@ -234,7 +248,7 @@ If no backup is currently active:
 # Interactive backup with prompts
 sudo ./panzerbackup.sh backup
 
-# Named backup with specific settings
+# Named backup with compression and encryption
 sudo ./panzerbackup.sh backup --name pve-node1 --compress --encrypt
 
 # Automated backup with passphrase file
@@ -258,7 +272,7 @@ sudo ./panzerbackup.sh status
 ### Restore Examples
 
 ```bash
-# Interactive restore
+# Interactive restore (latest valid backup)
 sudo ./panzerbackup.sh restore
 
 # Dry-run (test only, no writing)
@@ -269,6 +283,12 @@ sudo ./panzerbackup.sh restore --target /dev/sdb
 
 # Restore with interactive disk selection menu
 sudo ./panzerbackup.sh restore --select-disk
+
+# Choose which backup file to restore from
+sudo ./panzerbackup.sh restore --select-backup
+
+# Restore encrypted backup using passphrase file
+sudo ./panzerbackup.sh restore --passfile /root/.backup-pass
 ```
 
 ### Verify
@@ -306,8 +326,8 @@ sudo ./panzerbackup.sh stop
 | `--name NAME` | Custom backup name (default: hostname) |
 | `--compress` / `--no-compress` | Force compression on/off |
 | `--zstd-level N` | Compression level 1–19 (default: 6) |
-| `--encrypt` / `--no-encrypt` | Enable/disable GPG encryption |
-| `--passfile FILE` | Read passphrase from file |
+| `--encrypt` / `--no-encrypt` | Enable/disable GPG AES-256 encryption |
+| `--passfile FILE` | Read passphrase from file (for automation) |
 | `--post reboot\|shutdown\|none` | Action after backup |
 | `--disk /dev/XYZ` | Override system disk detection |
 | `--select-backup` | Show menu if multiple backup targets found |
@@ -318,9 +338,9 @@ sudo ./panzerbackup.sh stop
 | `--dry-run` | Test restore without writing |
 | `--target /dev/sdX` | Restore to specific disk |
 | `--select-disk` | Show interactive disk selection menu |
+| `--select-backup` | Interactively choose which backup file to restore |
 | `--post reboot\|shutdown\|none` | Action after restore |
 | `--passfile FILE` | Read decryption passphrase from file |
-| `--select-backup` | Show menu if multiple backup targets found |
 
 ---
 
@@ -427,7 +447,7 @@ e2label /dev/sdX panzerbackup
 ### Required Packages
 * `lsblk`, `dd`, `sha256sum`, `sfdisk`, `blockdev` — usually pre-installed
 * `zstd` — for compression (auto-install prompt if missing)
-* `gnupg` — for encryption
+* `gnupg` — for encryption (`gpg` must be available when using `--encrypt`)
 
 The script automatically checks and guides you to install missing tools.
 
@@ -456,7 +476,7 @@ Backups are stored with the following naming scheme:
 |---|---|
 | `.img` | Raw disk image |
 | `.img.zst` | zstd compressed image |
-| `.img.gpg` | GPG encrypted image |
+| `.img.gpg` | GPG encrypted image (no compression) |
 | `.img.zst.gpg` | Compressed + encrypted image |
 | `.sha256` | SHA256 checksum |
 | `.sfdisk` | Partition table backup |
@@ -467,6 +487,7 @@ Located in `/run/panzerbackup/`:
 |---|---|
 | `status` | Current operation status (last line) |
 | `pid` | Worker process PID |
+| `start_ts` | Unix timestamp of backup start (used for elapsed time) |
 | `worker.sh` | Generated background worker script |
 | `startup.log` | Worker startup messages |
 
@@ -560,10 +581,17 @@ BACKUP_NAME=prod-$(hostname -s) /path/to/panzerbackup.sh backup \
   >> /var/log/panzerbackup-cron.log 2>&1
 ```
 
-### Disaster Recovery
+### Disaster Recovery from Live USB
 ```bash
 # Boot from live USB, mount backup drive, restore
+# Protected disks (live USB, backup medium) are automatically blocked
 sudo ./panzerbackup.sh restore --select-disk
+```
+
+### Restore a Specific Backup
+```bash
+# Choose interactively which backup file to restore
+sudo ./panzerbackup.sh restore --select-backup --select-disk
 ```
 
 ### Remote Monitoring via SSH
@@ -601,8 +629,10 @@ Every bit of feedback helps make Panzerbackup even more robust.
 * Can restore to new hardware without hassle
 * Backups keep running even if your SSH session is interrupted
 * Named backups make managing multiple systems easy
-* **Live status monitoring** shows real-time progress and logs
+* **Live status monitoring** shows real-time progress, elapsed time, and logs
 * **Systemd integration** enables professional scheduled backups
+* **Disk protection** prevents accidental overwrite of live USB, backup medium, or script source disk
+* **GPG encryption** protects backups at rest with AES-256
 * Colors are only shown in interactive terminals (`-t 1` check), safe for systemd/cron logs
 
 ---
