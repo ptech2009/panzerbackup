@@ -81,9 +81,48 @@ format_elapsed() {
   local sec="${1:-0}"
   printf '%02d:%02d:%02d' $((sec/3600)) $(((sec%3600)/60)) $((sec%60))
 }
+localize_status_text() {
+  local s="${1:-}"
+
+  if [[ "$LANG_CHOICE" == "en" ]]; then
+    s="${s//Proxmox VMs\/CTs werden pausiert.../Pausing Proxmox VMs\/CTs...}"
+    s="${s//VMs\/CTs werden fortgesetzt.../Resuming VMs\/CTs...}"
+    s="${s//Erstelle Partitionstabelle.../Creating partition table...}"
+    s="${s//Kopiere Disk-Image.../Copying disk image...}"
+    s="${s//Räume alte Backups auf.../Cleaning up old backups...}"
+    s="${s//Prüfe Checksumme.../Verifying checksum...}"
+    s="${s//Verwende /Using }"
+    s="${s//Dry-Run abgeschlossen/Dry-run completed}"
+    s="${s//Erfolgreich abgeschlossen/Completed successfully}"
+    s="${s//Initialisiere.../Initializing...}"
+    s="${s//Finalisiere.../Finalizing...}"
+    s="${s//Abgebrochen/Aborted}"
+    s="${s//FEHLER:/ERROR:}"
+    s="${s// läuft.../ running...}"
+    s="${s// läuft/ running}"
+  else
+    s="${s//Pausing Proxmox VMs\/CTs.../Proxmox VMs\/CTs werden pausiert...}"
+    s="${s//Resuming VMs\/CTs.../VMs\/CTs werden fortgesetzt...}"
+    s="${s//Creating partition table.../Erstelle Partitionstabelle...}"
+    s="${s//Copying disk image.../Kopiere Disk-Image...}"
+    s="${s//Cleaning up old backups.../Räume alte Backups auf...}"
+    s="${s//Verifying checksum.../Prüfe Checksumme...}"
+    s="${s//Using /Verwende }"
+    s="${s//Dry-run completed/Dry-Run abgeschlossen}"
+    s="${s//Completed successfully/Erfolgreich abgeschlossen}"
+    s="${s//Initializing.../Initialisiere...}"
+    s="${s//Finalizing.../Finalisiere...}"
+    s="${s//Aborted/Abgebrochen}"
+    s="${s//ERROR:/FEHLER:}"
+    s="${s// running.../ läuft...}"
+    s="${s// running/ läuft}"
+  fi
+
+  echo "$s"
+}
 get_status() {
   if [[ -s "$STATUS_FILE" ]]; then
-    tail -n1 "$STATUS_FILE"
+    localize_status_text "$(tail -n1 "$STATUS_FILE")"
   else
     [[ "$LANG_CHOICE" == "en" ]] && echo "Initializing..." || echo "Initialisiere..."
   fi
