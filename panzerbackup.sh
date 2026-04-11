@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="2.6"
+VERSION="2.6.1"
 
 # =====[ Sane defaults for env -i + set -u ]===================================
 : "${LC_ALL:=C}"; export LC_ALL
