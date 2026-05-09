@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="2.6.1"
+VERSION="2.6.2"
 
 # =====[ Sane defaults for env -i + set -u ]===================================
 : "${LC_ALL:=C}"; export LC_ALL
@@ -829,7 +829,7 @@ do_backup_background() {
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="2.6"
+VERSION="2.6.2"
 set -E
 trap 'rc=$?; if [[ "${LANG_CHOICE:-de}" == "de" ]]; then set_status "FEHLER: Backup abgebrochen (RC=$rc)"; else set_status "ERROR: Backup aborted (RC=$rc)"; fi; echo "ERROR (Backup Worker) line $LINENO: $BASH_COMMAND (RC=$rc)"; exit $rc' ERR
 
@@ -848,6 +848,28 @@ run_inhibited() {
   else
     "$@"
   fi
+}
+
+post_action_worker() {
+  case "${POST_ACTION:-none}" in
+    reboot)
+      set_status "$(status_msg "BACKUP: Erfolgreich abgeschlossen - Neustart in 5 Sekunden ..." "BACKUP: Completed successfully - rebooting in 5 seconds ...")"
+      msg "[*] Neustart in 5 Sekunden ..." "[*] Rebooting in 5 seconds ..."
+      sleep 5
+      systemctl reboot
+      ;;
+    shutdown)
+      set_status "$(status_msg "BACKUP: Erfolgreich abgeschlossen - Shutdown in 5 Sekunden ..." "BACKUP: Completed successfully - shutting down in 5 seconds ...")"
+      msg "[*] Shutdown in 5 Sekunden ..." "[*] Shutting down in 5 seconds ..."
+      sleep 5
+      systemctl poweroff
+      ;;
+    none|"")
+      ;;
+    *)
+      msg "[!] Unbekannte Post-Action ignoriert: ${POST_ACTION}" "[!] Unknown post-action ignored: ${POST_ACTION}"
+      ;;
+  esac
 }
 
 find_latest_valid_worker() {
@@ -1052,6 +1074,8 @@ pve_quiesce_end() {
   echo "Backup Worker Ende: $(date '+%Y-%m-%d %H:%M:%S')"
   echo "=========================================="
   rm -f "$PID_FILE"
+
+  post_action_worker
 }
 EOFWORKER
 
@@ -1067,6 +1091,7 @@ EOFWORKER
     FINAL_FILE="$FINAL_FILE" TEMP_FILE="$TEMP_FILE" TEMP_SHA="$TEMP_SHA" \
     USE_COMPRESS="$USE_COMPRESS" ENCRYPT_MODE="$ENCRYPT_MODE" \
     ENCRYPT_PASSPHRASE="$ENCRYPT_PASSPHRASE" ZSTD_LEVEL="$ZSTD_LEVEL" \
+    POST_ACTION="$POST_ACTION" \
     STATUS_FILE="$STATUS_FILE" PID_FILE="$PID_FILE" \
     LOG_FILE="$LOG_FILE_DEFAULT" KEEP="$KEEP" \
     nohup setsid bash "$WORKER_SCRIPT" >> "$STARTUP_LOG" 2>&1 &
