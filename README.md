@@ -72,7 +72,7 @@ LANG_CHOICE=de ./panzerbackup.sh
 
 ### ✅ **Compression**
 * Uses `zstd` with multi-threading (`-T0`) for fast and efficient backups
-* Auto mode: uses compression if `zstd` is available, falls back to raw image otherwise
+* Compression is always enabled — consistent `.zst` output for all backup files
 * Automatic installation prompt if `zstd` is missing
 * Configurable compression level via `--zstd-level N` or `ZSTD_LEVEL` (default: 6, range: 1–19)
 
@@ -149,7 +149,7 @@ When launched without arguments, the script shows a full interactive menu:
 
 ```
 ╔═══════════════════════════════════════════════════╗
-║        ▄▅▆ Panzerbackup Manager v2.6 ▆▅▄          ║
+║      ▄▅▆ Panzerbackup Manager v2.6.3 ▆▅▄          ║
 ╚═══════════════════════════════════════════════════╝
 
 System disk: /dev/sda
@@ -157,15 +157,13 @@ Backup dir:  /mnt/panzerbackup
 
 STATUS: Ready
 
-1) Backup   - Start backup (auto-compression)
+1) Backup   - Start backup (zstd compression)
 2) Restore  - Restore latest valid backup
 3) Dry-Run  - Restore verify only (no write)
-4) Backup   - Without compression
-5) Backup   - With compression (zstd)
-6) Restore  - With disk selection
-7) Verify   - Verify latest backup (sha256)
-8) Progress - Show live status
-9) Log      - View log file
+4) Restore  - With disk selection
+5) Verify   - Verify latest backup (sha256)
+6) Progress - Show live status
+7) Log      - View log file
 S) Stop     - Stop running job
 0) Exit
 ```
@@ -184,7 +182,7 @@ During backup, you will be prompted for:
 The status display provides real-time monitoring of running backups:
 
 **Access via:**
-- Menu option 8 (Progress)
+- Menu option 6 (Progress)
 - Command line: `sudo ./panzerbackup.sh status`
 
 **Features:**
@@ -249,16 +247,16 @@ If no backup is currently active:
 sudo ./panzerbackup.sh backup
 
 # Named backup with compression and encryption
-sudo ./panzerbackup.sh backup --name pve-node1 --compress --encrypt
+sudo ./panzerbackup.sh backup --name pve-node1 --encrypt
 
 # Automated backup with passphrase file
-sudo ./panzerbackup.sh backup --name homeserver --compress --passfile /root/.backup-pass --post shutdown
+sudo ./panzerbackup.sh backup --name homeserver --passfile /root/.backup-pass --post shutdown
 
 # Set name via environment variable
-BACKUP_NAME=prod-server sudo ./panzerbackup.sh backup --compress
+BACKUP_NAME=prod-server sudo ./panzerbackup.sh backup
 
 # Start backup and monitor progress
-sudo ./panzerbackup.sh backup --name server1 --compress
+sudo ./panzerbackup.sh backup --name server1
 sudo ./panzerbackup.sh status  # Watch live progress
 ```
 
@@ -324,7 +322,6 @@ sudo ./panzerbackup.sh stop
 | Flag | Description |
 |---|---|
 | `--name NAME` | Custom backup name (default: hostname) |
-| `--compress` / `--no-compress` | Force compression on/off |
 | `--zstd-level N` | Compression level 1–19 (default: 6) |
 | `--encrypt` / `--no-encrypt` | Enable/disable GPG AES-256 encryption |
 | `--passfile FILE` | Read passphrase from file (for automation) |
@@ -474,9 +471,7 @@ Backups are stored with the following naming scheme:
 ### File Extensions
 | Extension | Description |
 |---|---|
-| `.img` | Raw disk image |
 | `.img.zst` | zstd compressed image |
-| `.img.gpg` | GPG encrypted image (no compression) |
 | `.img.zst.gpg` | Compressed + encrypted image |
 | `.sha256` | SHA256 checksum |
 | `.sfdisk` | Partition table backup |
@@ -508,7 +503,7 @@ KEEP=5 ./panzerbackup.sh backup
 BACKUP_NAME=production ./panzerbackup.sh backup
 
 # Custom compression level (1-19, default: 6)
-ZSTD_LEVEL=9 ./panzerbackup.sh backup --compress
+ZSTD_LEVEL=9 ./panzerbackup.sh backup
 
 # Override disk detection
 DISK_OVERRIDE=/dev/sdb ./panzerbackup.sh backup
@@ -548,16 +543,16 @@ LANG_CHOICE=en
 ### Home Lab / Proxmox
 ```bash
 # Full backup of Proxmox host with compression and encryption
-sudo ./panzerbackup.sh backup --name pve-main --compress --encrypt --post shutdown
+sudo ./panzerbackup.sh backup --name pve-main --encrypt --post shutdown
 ```
 
 ### Multiple Servers on One Backup Drive
 ```bash
 # Server 1
-sudo ./panzerbackup.sh backup --name web-server --compress
+sudo ./panzerbackup.sh backup --name web-server
 
 # Server 2
-sudo ./panzerbackup.sh backup --name db-server --compress
+sudo ./panzerbackup.sh backup --name db-server
 
 # All backups stored on same external drive, easily distinguishable by name
 ```
@@ -575,7 +570,6 @@ sudo ./panzerbackup.sh status
 # /etc/cron.monthly/panzerbackup
 #!/bin/bash
 BACKUP_NAME=prod-$(hostname -s) /path/to/panzerbackup.sh backup \
-  --compress \
   --passfile /root/.backup-pass \
   --post none \
   >> /var/log/panzerbackup-cron.log 2>&1
@@ -597,7 +591,7 @@ sudo ./panzerbackup.sh restore --select-backup --select-disk
 ### Remote Monitoring via SSH
 ```bash
 # Start backup on remote server
-ssh root@server 'cd /root/panzerbackup && ./panzerbackup.sh backup --name prod --compress'
+ssh root@server 'cd /root/panzerbackup && ./panzerbackup.sh backup --name prod'
 
 # Disconnect SSH — backup continues
 
@@ -629,6 +623,7 @@ Every bit of feedback helps make Panzerbackup even more robust.
 * Can restore to new hardware without hassle
 * Backups keep running even if your SSH session is interrupted
 * Named backups make managing multiple systems easy
+* **zstd compression** is always enabled — fast, efficient, consistent `.zst` output
 * **Live status monitoring** shows real-time progress, elapsed time, and logs
 * **Systemd integration** enables professional scheduled backups
 * **Disk protection** prevents accidental overwrite of live USB, backup medium, or script source disk
