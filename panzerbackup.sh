@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="2.6.2"
+VERSION="2.6.3"
 
 # =====[ Sane defaults for env -i + set -u ]===================================
 : "${LC_ALL:=C}"; export LC_ALL
@@ -459,7 +459,6 @@ find_latest_any() {
 # =====================[ zstd ensure ]=========================================
 ensure_zstd_if_needed() {
   local want="$1"
-  [[ "$want" == "off" ]] && return 0
   has_cmd zstd && return 0
   if [[ "$want" == "on" || "$want" == "auto" ]]; then
     msg "[*] zstd ist nicht installiert." "[*] zstd is not installed."
@@ -468,14 +467,12 @@ ensure_zstd_if_needed() {
       DEBIAN_FRONTEND=noninteractive apt-get update -y || true
       DEBIAN_FRONTEND=noninteractive apt-get install -y zstd || true
       if ! has_cmd zstd; then
-        [[ "$want" == "on" ]] && die "Kompression gefordert, aber zstd konnte nicht installiert werden." "Compression required, but zstd could not be installed."
-        msg "[!] zstd nicht verfügbar – fahre ohne Kompression fort." "[!] zstd not available – continuing without compression."
+        die "Kompression ist erforderlich, aber zstd konnte nicht installiert werden." "Compression is required, but zstd could not be installed."
       else
         msg "[✓] zstd installiert." "[✓] zstd installed."
       fi
     else
-      [[ "$want" == "on" ]] && die "Kompression gewünscht, aber zstd fehlt." "Compression requested, but zstd is missing."
-      msg "[!] zstd nicht installiert – fahre ohne Kompression fort." "[!] zstd not installed – continuing without compression."
+      die "Kompression ist erforderlich, aber zstd fehlt." "Compression is required, but zstd is missing."
     fi
   fi
 }
@@ -629,7 +626,7 @@ AUTO_DELETE_OLDEST="${AUTO_DELETE_OLDEST:-1}"
 DATE="$(date +'%Y-%m-%d_%H-%M-%S')"
 BACKUP_NAME="${BACKUP_NAME:-}"
 IMG_PREFIX=""
-COMPRESS_MODE="auto"
+COMPRESS_MODE="on"
 ZSTD_LEVEL="${ZSTD_LEVEL:-6}"
 POST_ACTION="none"
 POST_ACTION_PRESET=""
@@ -701,7 +698,6 @@ parse_backup_flags() {
       resume-orphans) resume_orphans; exit 0 ;;
       stop) do_stop; exit 0 ;;
       --compress) COMPRESS_MODE="on"; shift ;;
-      --no-compress) COMPRESS_MODE="off"; shift ;;
       --zstd-level) ZSTD_LEVEL="${2:-6}"; shift 2 ;;
       --post) POST_ACTION="${2:-none}"; POST_ACTION_PRESET="1"; shift 2 ;;
       --encrypt) ENCRYPT_MODE="gpg"; shift ;;
@@ -710,7 +706,7 @@ parse_backup_flags() {
       --select-backup) SELECT_BACKUP="true"; shift ;;
       --disk) DISK="$2"; shift 2 ;;
       --name) BACKUP_NAME="$2"; shift 2 ;;
-      *) break ;;
+      *) die "Unbekannte Backup-Option: $1" "Unknown backup option: $1" ;;
     esac
   done
   printf '%s\0' "$@"
@@ -829,7 +825,7 @@ do_backup_background() {
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="2.6.2"
+VERSION="2.6.3"
 set -E
 trap 'rc=$?; if [[ "${LANG_CHOICE:-de}" == "de" ]]; then set_status "FEHLER: Backup abgebrochen (RC=$rc)"; else set_status "ERROR: Backup aborted (RC=$rc)"; fi; echo "ERROR (Backup Worker) line $LINENO: $BASH_COMMAND (RC=$rc)"; exit $rc' ERR
 
@@ -1015,25 +1011,8 @@ pve_quiesce_end() {
       | sha256sum -b \
       | awk '"'"'{print $1"  '"$(basename "$FINAL_FILE")"'"}'"'"' > "'"$TEMP_SHA"'"
     '
-  elif [[ "$ENCRYPT_MODE" == "gpg" ]]; then
-    msg "[*] dd | gpg | tee | sha256sum …" "[*] dd | gpg | tee | sha256sum …"
-    set_status "$(status_msg "BACKUP: dd | gpg läuft..." "BACKUP: dd | gpg running...")"
-    run_inhibited "Panzerbackup läuft / Panzerbackup running" bash -c '
-      dd if='"$DISK"' bs=64M status=progress \
-      | gpg --batch --yes --symmetric --cipher-algo AES256 --pinentry-mode loopback --passphrase-fd 3 3<<<"'"$ENCRYPT_PASSPHRASE"'" \
-      | tee "'"$TEMP_FILE"'" \
-      | sha256sum -b \
-      | awk '"'"'{print $1"  '"$(basename "$FINAL_FILE")"'"}'"'"' > "'"$TEMP_SHA"'"
-    '
   else
-    msg "[*] dd (roh) | tee | sha256sum …" "[*] dd (raw) | tee | sha256sum …"
-    set_status "$(status_msg "BACKUP: dd (raw) läuft..." "BACKUP: dd (raw) running...")"
-    run_inhibited "Panzerbackup läuft / Panzerbackup running" bash -c '
-      dd if='"$DISK"' bs=64M status=progress \
-      | tee "'"$TEMP_FILE"'" \
-      | sha256sum -b \
-      | awk '"'"'{print $1"  '"$(basename "$FINAL_FILE")"'"}'"'"' > "'"$TEMP_SHA"'"
-    '
+    die "Interner Fehler: Kompression ist deaktiviert." "Internal error: compression is disabled."
   fi
   set +o pipefail
 
@@ -1133,12 +1112,7 @@ do_backup() {
 
   msg "→ Backup-Name: $backup_name" "→ Backup name: $backup_name"
 
-  USE_COMPRESS="false"
-  if [[ "$COMPRESS_MODE" == "on" ]]; then
-    USE_COMPRESS="true"
-  elif [[ "$COMPRESS_MODE" == "auto" && $(has_cmd zstd && echo yes || echo no) == "yes" ]]; then
-    USE_COMPRESS="true"
-  fi
+  USE_COMPRESS="true"
 
   FINAL_FILE="${BACKUP_DIR}/${IMG_PREFIX}.img"
   [[ "$USE_COMPRESS" == "true" ]] && FINAL_FILE="${FINAL_FILE}.zst"
@@ -1480,28 +1454,24 @@ show_menu() {
 
   echo ""
   if [[ "$LANG_CHOICE" == "de" ]]; then
-    echo "1) Backup   - Backup starten (auto-Kompression)"
+    echo "1) Backup   - Backup starten (zstd-Kompression)"
     echo "2) Restore  - Letztes gültiges Backup wiederherstellen"
     echo "3) Dry-Run  - Restore nur prüfen (kein Schreiben)"
-    echo "4) Backup   - Ohne Kompression"
-    echo "5) Backup   - Mit Kompression (zstd)"
-    echo "6) Restore  - Mit Disk-Auswahl"
-    echo "7) Verify   - Letztes Backup prüfen (sha256)"
-    echo "8) Progress - Live-Status anzeigen"
-    echo "9) Log      - Logfile anzeigen"
+    echo "4) Restore  - Mit Disk-Auswahl"
+    echo "5) Verify   - Letztes Backup prüfen (sha256)"
+    echo "6) Progress - Live-Status anzeigen"
+    echo "7) Log      - Logfile anzeigen"
     echo "S) Stop     - Laufenden Vorgang abbrechen"
     echo "0) Exit"
     echo ""
   else
-    echo "1) Backup   - Start backup (auto-compression)"
+    echo "1) Backup   - Start backup (zstd compression)"
     echo "2) Restore  - Restore latest valid backup"
     echo "3) Dry-Run  - Restore verify only (no write)"
-    echo "4) Backup   - Without compression"
-    echo "5) Backup   - With compression (zstd)"
-    echo "6) Restore  - With disk selection"
-    echo "7) Verify   - Verify latest backup (sha256)"
-    echo "8) Progress - Show live status"
-    echo "9) Log      - View log file"
+    echo "4) Restore  - With disk selection"
+    echo "5) Verify   - Verify latest backup (sha256)"
+    echo "6) Progress - Show live status"
+    echo "7) Log      - View log file"
     echo "S) Stop     - Stop running job"
     echo "0) Exit"
     echo ""
@@ -1518,7 +1488,7 @@ Erkannt:
   Live-System: $([[ "$LIVE_ENV" -eq 1 ]] && echo ja || echo nein)
 
 Aufruf:
-  $0 backup  [--name NAME] [--compress|--no-compress] [--zstd-level N] [--encrypt|--no-encrypt] [--passfile FILE] [--post reboot|shutdown|none] [--select-backup] [--disk /dev/XYZ]
+  $0 backup  [--name NAME] [--compress] [--zstd-level N] [--encrypt|--no-encrypt] [--passfile FILE] [--post reboot|shutdown|none] [--select-backup] [--disk /dev/XYZ]
   $0 restore [--dry-run] [--select-disk] [--target /dev/sdX] [--post reboot|shutdown|none] [--passfile FILE] [--select-backup] [--disk /dev/XYZ]
   $0 verify
   $0 status
@@ -1542,7 +1512,7 @@ Detected:
   Live system:  $([[ "$LIVE_ENV" -eq 1 ]] && echo yes || echo no)
 
 Usage:
-  $0 backup  [--name NAME] [--compress|--no-compress] [--zstd-level N] [--encrypt|--no-encrypt] [--passfile FILE] [--post reboot|shutdown|none] [--select-backup] [--disk /dev/XYZ]
+  $0 backup  [--name NAME] [--compress] [--zstd-level N] [--encrypt|--no-encrypt] [--passfile FILE] [--post reboot|shutdown|none] [--select-backup] [--disk /dev/XYZ]
   $0 restore [--dry-run] [--select-disk] [--target /dev/sdX] [--post reboot|shutdown|none] [--passfile FILE] [--select-backup] [--disk /dev/XYZ]
   $0 verify
   $0 status
@@ -1602,14 +1572,14 @@ fi
 while true; do
   show_menu
   if [[ "$LANG_CHOICE" == "en" ]]; then
-    read -rp "Choice (0-9,S): " choice || { echo "No input (EOF) — exiting."; exit 0; }
+    read -rp "Choice (0-7,S): " choice || { echo "No input (EOF) — exiting."; exit 0; }
   else
-    read -rp "Auswahl (0-9,S): " choice || { echo "Keine Eingabe erkannt (EOF) – beende."; exit 0; }
+    read -rp "Auswahl (0-7,S): " choice || { echo "Keine Eingabe erkannt (EOF) – beende."; exit 0; }
   fi
 
   case "${choice:-}" in
     1)
-      COMPRESS_MODE="auto"
+      COMPRESS_MODE="on"
       BACKUP_NAME=""
       if [[ -t 0 && -t 1 ]]; then
         if [[ "$LANG_CHOICE" == "de" ]]; then
@@ -1630,43 +1600,17 @@ while true; do
       do_restore
       RESTORE_DRY_RUN="" ;;
     4)
-      COMPRESS_MODE="off"
-      BACKUP_NAME=""
-      if [[ -t 0 && -t 1 ]]; then
-        if [[ "$LANG_CHOICE" == "de" ]]; then
-          read -rp "Backup-Name (z.B. 'proxmox-node1') [Standard: $(hostname -s)]: " BACKUP_NAME
-        else
-          read -rp "Backup name (e.g., 'proxmox-node1') [Default: $(hostname -s)]: " BACKUP_NAME
-        fi
-        prompt_post_action "Backup"
-        prompt_encryption
-      fi
-      do_backup ;;
-    5)
-      COMPRESS_MODE="on"
-      BACKUP_NAME=""
-      if [[ -t 0 && -t 1 ]]; then
-        if [[ "$LANG_CHOICE" == "de" ]]; then
-          read -rp "Backup-Name (z.B. 'proxmox-node1') [Standard: $(hostname -s)]: " BACKUP_NAME
-        else
-          read -rp "Backup name (e.g., 'proxmox-node1') [Default: $(hostname -s)]: " BACKUP_NAME
-        fi
-        prompt_post_action "Backup"
-        prompt_encryption
-      fi
-      do_backup ;;
-    6)
       SELECT_DISK="true"
       if [[ -t 0 && -t 1 && -z "${POST_ACTION_PRESET:-}" ]]; then prompt_post_action "Restore"; fi
       do_restore
       SELECT_DISK="" ;;
-    7)
+    5)
       { clear 2>/dev/null || printf '\033c'; } || true
       do_verify
       if [[ "$LANG_CHOICE" == "en" ]]; then read -rp "Press Enter to continue..." _ || true
       else read -rp "Drücke Enter um fortzufahren..." _ || true; fi ;;
-    8) show_status ;;
-    9) view_log ;;
+    6) show_status ;;
+    7) view_log ;;
     S|s)
       do_stop
       if [[ "$LANG_CHOICE" == "en" ]]; then read -rp "Press Enter to continue..." _ || true
