@@ -1,0 +1,85 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine release info
+        id: info
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "title=$TAG" >> "$GITHUB_OUTPUT"
+
+          if [ -f CHANGELOG.md ]; then
+            awk -v tag="$TAG" '
+              BEGIN { found=0 }
+              $0 ~ "^##[[:space:]]*\\[?" tag "\\]?" { found=1; print; next }
+              found && $0 ~ "^##[[:space:]]" { exit }
+              found { print }
+            ' CHANGELOG.md > release-notes.md
+
+            if [ ! -s release-notes.md ]; then
+              cp CHANGELOG.md release-notes.md
+            fi
+          else
+            echo "$TAG" > release-notes.md
+          fi
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${{ steps.info.outputs.tag }}" >/dev/null 2>&1; then
+            echo "GitHub release already exists."
+          else
+            gh release create "${{ steps.info.outputs.tag }}" \
+              --title "${{ steps.info.outputs.title }}" \
+              --notes-file release-notes.md
+          fi
+
+      - name: Create Codeberg Release
+        env:
+          CODEBERG_TOKEN: ${{ secrets.CODEBERG_TOKEN }}
+          CODEBERG_OWNER: Ptech09
+          CODEBERG_REPO: panzerbackup
+          TAG: ${{ steps.info.outputs.tag }}
+        run: |
+          RESPONSE="$(curl -sS -o /tmp/codeberg-release-response.json -w "%{http_code}" \
+            -X POST "https://codeberg.org/api/v1/repos/${CODEBERG_OWNER}/${CODEBERG_REPO}/releases" \
+            -H "Authorization: token ${CODEBERG_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n \
+              --arg tag "$TAG" \
+              --arg title "$TAG" \
+              --arg body "$(cat release-notes.md)" \
+              '{
+                tag_name: $tag,
+                target_commitish: "main",
+                name: $title,
+                body: $body,
+                draft: false,
+                prerelease: false
+              }')" )"
+
+          if [ "$RESPONSE" = "201" ]; then
+            echo "Codeberg release created."
+          elif [ "$RESPONSE" = "409" ]; then
+            echo "Codeberg release already exists."
+          else
+            echo "Codeberg API returned HTTP $RESPONSE"
+            cat /tmp/codeberg-release-response.json
+            exit 1
+          fi
