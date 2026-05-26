@@ -1,6 +1,6 @@
 # 🛡️ Panzerbackup
 
-[![Version](https://img.shields.io/badge/version-2.6.4-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.6.5-blue.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 **Panzerbackup** is a disaster recovery backup script for Linux and Proxmox. It creates a **full 1:1 disk image** of your running system – comparable to Clonezilla, but fully automated and usable online (without reboot).
@@ -130,7 +130,8 @@ LANG_CHOICE=de ./panzerbackup.sh
 
 ### ✅ **Stop Running Backup**
 * Gracefully stop a running backup via menu option `S` or `./panzerbackup.sh stop`
-* Sends INT → TERM → KILL signals with escalation
+* Stops the whole worker process group so `dd`, `zstd`, `gpg`, `tee`, and `sha256sum` cannot continue in the background
+* Sends INT → TERM → KILL signals with escalation and recursive process-tree fallback
 * Automatically resumes/unfreezes Proxmox VMs/CTs after stop
 
 ---
@@ -152,7 +153,7 @@ When launched without arguments, the script shows a full interactive menu:
 
 ```
 ╔═══════════════════════════════════════════════════╗
-║      ▄▅▆ Panzerbackup Manager v2.6.4 ▆▅▄          ║
+║      ▄▅▆ Panzerbackup Manager v2.6.5 ▆▅▄          ║
 ╚═══════════════════════════════════════════════════╝
 
 System disk: /dev/sda
@@ -318,6 +319,8 @@ sudo ./panzerbackup.sh log --file /path/to/custom.log
 # Gracefully stop a running backup (with confirmation prompt)
 sudo ./panzerbackup.sh stop
 ```
+
+The stop command terminates the complete background worker process group. This prevents partially detached backup pipelines from continuing after the visible worker has already exited.
 
 ### Available Flags
 
