@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="2.6.5"
+VERSION="2.6.6"
 
 # =====[ Sane defaults for env -i + set -u ]===================================
 : "${LC_ALL:=C}"; export LC_ALL
@@ -60,9 +60,11 @@ RUN_DIR="${RUN_DIR:-/run/panzerbackup}"
 mkdir -p "$RUN_DIR"
 STATUS_FILE="${STATUS_FILE:-$RUN_DIR/status}"
 PID_FILE="${PID_FILE:-$RUN_DIR/pid}"
+START_LOCK_DIR="${START_LOCK_DIR:-$RUN_DIR/start.lock}"
 STARTUP_LOG="${STARTUP_LOG:-$RUN_DIR/startup.log}"
 WORKER_SCRIPT="${WORKER_SCRIPT:-$RUN_DIR/worker.sh}"
 START_TS_FILE="${START_TS_FILE:-$RUN_DIR/start_ts}"
+START_LOCK_PID_FILE="${START_LOCK_PID_FILE:-$START_LOCK_DIR/pid}"
 
 set_status() { echo "$1" > "$STATUS_FILE"; }
 mark_run_started() { date +%s > "$START_TS_FILE"; }
@@ -151,6 +153,31 @@ is_running() {
   fi
   rm -f "$PID_FILE"
   return 1
+}
+
+acquire_start_lock() {
+  local owner=""
+  if mkdir "$START_LOCK_DIR" 2>/dev/null; then
+    echo "$$" > "$START_LOCK_PID_FILE"
+    return 0
+  fi
+
+  if [[ -f "$START_LOCK_PID_FILE" ]]; then
+    owner="$(cat "$START_LOCK_PID_FILE" 2>/dev/null || true)"
+  fi
+  if [[ "$owner" =~ ^[0-9]+$ ]] && ! kill -0 "$owner" 2>/dev/null; then
+    rm -f "$START_LOCK_PID_FILE"
+    if rmdir "$START_LOCK_DIR" 2>/dev/null && mkdir "$START_LOCK_DIR" 2>/dev/null; then
+      echo "$$" > "$START_LOCK_PID_FILE"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+release_start_lock() {
+  rm -f "$START_LOCK_PID_FILE"
+  rmdir "$START_LOCK_DIR" 2>/dev/null || true
 }
 
 get_process_group() {
@@ -473,7 +500,7 @@ find_latest_valid() {
     "$dir"/panzer_*.img.zst "$dir"/panzer_*.img 2>/dev/null || true)
   for img in "${IMGS[@]:-}"; do
     [[ -f "${img}.sha256" ]] || continue
-    M "  - Prüfe $(basename "$img") ..." "  - Checking $(basename "$img") ..."
+    M "  - Prüfe $(basename "$img") ..." "  - Checking $(basename "$img") ..." >&2
     ( cd "$dir" && sha256sum -c "$(basename "$img").sha256" >/dev/null ) && { echo "$img"; return 0; }
   done
   return 1
@@ -545,33 +572,43 @@ cleanup_stale_partial_files() {
   done
 }
 
-refresh_latest_ok_links() {
-  local newest_valid=""
-  newest_valid="$(find_latest_valid "$BACKUP_DIR" || true)"
-  if [[ -n "$newest_valid" && -f "$newest_valid" ]]; then
-    local base="${newest_valid##*/}"
-    local sfdisk_file="${base%.img*}.sfdisk"
-    ln -sfn "$base" "${BACKUP_DIR}/LATEST_OK"
-    [[ -f "${BACKUP_DIR}/${base}.sha256" ]] && ln -sfn "${base}.sha256" "${BACKUP_DIR}/LATEST_OK.sha256" || rm -f "${BACKUP_DIR}/LATEST_OK.sha256"
-    [[ -f "${BACKUP_DIR}/${sfdisk_file}" ]] && ln -sfn "${sfdisk_file}" "${BACKUP_DIR}/LATEST_OK.sfdisk" || rm -f "${BACKUP_DIR}/LATEST_OK.sfdisk"
-  else
-    rm -f "${BACKUP_DIR}/LATEST_OK" "${BACKUP_DIR}/LATEST_OK.sha256" "${BACKUP_DIR}/LATEST_OK.sfdisk"
-  fi
-}
-
-remove_backup_with_metadata() {
-  local old="${1:?}"
-  [[ -f "$old" ]] || return 0
-  local old_base old_sfdisk latest_target
+backup_allocated_bytes() {
+  local old="${1:?}" old_base old_sfdisk path blocks block_size total=0
   old_base="$(basename "$old")"
   old_sfdisk="${old_base%.img*}.sfdisk"
-  latest_target=""
+
+  for path in "$old" "${old}.sha256" "${BACKUP_DIR}/${old_sfdisk}"; do
+    [[ -f "$path" ]] || continue
+    read -r blocks block_size < <(stat -c '%b %B' -- "$path") || return 1
+    total=$(( total + blocks * block_size ))
+  done
+  echo "$total"
+}
+
+remove_backups_with_metadata() {
+  local old old_base old_sfdisk latest_target="" latest_base="" latest_deleted=0
+  local -a files=()
+
   if [[ -L "${BACKUP_DIR}/LATEST_OK" ]]; then
-    latest_target="$(basename "$(readlink -f "${BACKUP_DIR}/LATEST_OK" 2>/dev/null || true)")"
+    latest_target="$(readlink -f "${BACKUP_DIR}/LATEST_OK" 2>/dev/null || true)"
+    if [[ -n "$latest_target" ]]; then
+      latest_base="$(basename "$latest_target")"
+    else
+      latest_deleted=1
+    fi
   fi
-  rm -f -- "$old" "${old}.sha256" "${BACKUP_DIR}/${old_sfdisk}"
-  if [[ "$latest_target" == "$old_base" ]]; then
-    refresh_latest_ok_links
+
+  for old in "$@"; do
+    [[ -f "$old" ]] || continue
+    old_base="$(basename "$old")"
+    old_sfdisk="${old_base%.img*}.sfdisk"
+    files+=("$old" "${old}.sha256" "${BACKUP_DIR}/${old_sfdisk}")
+    [[ "$old_base" == "$latest_base" ]] && latest_deleted=1
+  done
+
+  (( ${#files[@]} > 0 )) && rm -f -- "${files[@]}"
+  if (( latest_deleted )); then
+    rm -f "${BACKUP_DIR}/LATEST_OK" "${BACKUP_DIR}/LATEST_OK.sha256" "${BACKUP_DIR}/LATEST_OK.sfdisk"
   fi
 }
 
@@ -593,29 +630,50 @@ cleanup_oldest_backups_until_enough_space() {
   [[ "$AUTO_DELETE_OLDEST" == "1" ]] || \
     die "Zu wenig Speicherplatz auf dem Backup-Ziel und automatisches Löschen ist deaktiviert." \
         "Not enough free space on backup target and automatic deletion is disabled."
+  need_cmd stat
 
   msg "[!] Zu wenig Speicherplatz. Älteste Backups werden automatisch entfernt..." \
       "[!] Not enough free space. Oldest backups will be deleted automatically..."
 
-  local old free_now
+  local old old_bytes free_now bytes_needed estimated index=0
+  local -a DELETE_BATCH=()
   mapfile -t OLD_BACKUPS < <(list_existing_backups_oldest_first)
   (( ${#OLD_BACKUPS[@]} > 0 )) || \
     die "Kein altes Backup zum Löschen vorhanden, aber zu wenig Speicherplatz." \
         "No old backup available for deletion, but there is not enough free space."
 
-  for old in "${OLD_BACKUPS[@]}"; do
-    [[ -f "$old" ]] || continue
-    msg "  - Lösche altes Backup: $(basename "$old")" \
-        "  - Deleting old backup: $(basename "$old")"
-    remove_backup_with_metadata "$old"
+  free_now="$free"
+  while (( free_now < required && index < ${#OLD_BACKUPS[@]} )); do
+    bytes_needed=$(( required - free_now ))
+    estimated=0
+    DELETE_BATCH=()
+
+    while (( index < ${#OLD_BACKUPS[@]} )); do
+      old="${OLD_BACKUPS[$index]}"
+      index=$(( index + 1 ))
+      [[ -f "$old" ]] || continue
+      DELETE_BATCH+=("$old")
+      old_bytes="$(backup_allocated_bytes "$old" 2>/dev/null || echo 0)"
+      [[ "$old_bytes" =~ ^[0-9]+$ ]] || old_bytes=0
+      estimated=$(( estimated + old_bytes ))
+      (( estimated >= bytes_needed && estimated > 0 )) && break
+    done
+
+    (( ${#DELETE_BATCH[@]} > 0 )) || break
+    for old in "${DELETE_BATCH[@]}"; do
+      msg "  - Lösche altes Backup: $(basename "$old")" \
+          "  - Deleting old backup: $(basename "$old")"
+    done
+    remove_backups_with_metadata "${DELETE_BATCH[@]}"
     free_now="$(get_free_bytes)"
     msg "    → Freier Speicher jetzt: $(human_bytes "$free_now")" \
         "    → Free space now: $(human_bytes "$free_now")"
-    if (( free_now >= required )); then
-      msg "[✓] Genug Speicherplatz freigeräumt." "[✓] Enough free space has been freed."
-      return 0
-    fi
   done
+
+  if (( free_now >= required )); then
+    msg "[✓] Genug Speicherplatz freigeräumt." "[✓] Enough free space has been freed."
+    return 0
+  fi
 
   free_now="$(get_free_bytes)"
   die "Trotz Löschen alter Backups nicht genug Speicher frei. Frei: $(human_bytes "$free_now"), benötigt: $(human_bytes "$required")" \
@@ -849,7 +907,7 @@ do_backup_background() {
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="2.6.5"
+VERSION="2.6.6"
 set -E
 trap 'rc=$?; if [[ "${LANG_CHOICE:-de}" == "de" ]]; then set_status "FEHLER: Backup abgebrochen (RC=$rc)"; else set_status "ERROR: Backup aborted (RC=$rc)"; fi; echo "ERROR (Backup Worker) line $LINENO: $BASH_COMMAND (RC=$rc)"; exit $rc' ERR
 
@@ -941,51 +999,30 @@ post_action_worker() {
   esac
 }
 
-find_latest_valid_worker() {
-  local dir="${1:?}"
-  if [[ -L "$dir/LATEST_OK" ]]; then
-    local t
-    t="$(readlink -f "$dir/LATEST_OK" || true)"
-    [[ -f "$t" ]] && echo "$t" && return 0
-  fi
-  mapfile -t IMGS < <(ls -1t \
-    "$dir"/panzer_*.img.zst.gpg "$dir"/panzer_*.img.gpg \
-    "$dir"/panzer_*.img.zst "$dir"/panzer_*.img 2>/dev/null || true)
-  for img in "${IMGS[@]:-}"; do
-    [[ -f "${img}.sha256" ]] || continue
-    ( cd "$dir" && sha256sum -c "$(basename "$img").sha256" >/dev/null 2>&1 ) && { echo "$img"; return 0; }
-  done
-  return 1
-}
+remove_backups_with_metadata_worker() {
+  local old old_base old_sfdisk latest_target="" latest_base="" latest_deleted=0
+  local -a files=()
 
-refresh_latest_ok_links_worker() {
-  local newest_valid=""
-  newest_valid="$(find_latest_valid_worker "$BACKUP_DIR" || true)"
-  if [[ -n "$newest_valid" && -f "$newest_valid" ]]; then
-    local base sfdisk_file
-    base="$(basename "$newest_valid")"
-    sfdisk_file="${base%.img*}.sfdisk"
-    ln -sfn "$base" "${BACKUP_DIR}/LATEST_OK"
-    [[ -f "${BACKUP_DIR}/${base}.sha256" ]] && ln -sfn "${base}.sha256" "${BACKUP_DIR}/LATEST_OK.sha256" || rm -f "${BACKUP_DIR}/LATEST_OK.sha256"
-    [[ -f "${BACKUP_DIR}/${sfdisk_file}" ]] && ln -sfn "${sfdisk_file}" "${BACKUP_DIR}/LATEST_OK.sfdisk" || rm -f "${BACKUP_DIR}/LATEST_OK.sfdisk"
-  else
-    rm -f "${BACKUP_DIR}/LATEST_OK" "${BACKUP_DIR}/LATEST_OK.sha256" "${BACKUP_DIR}/LATEST_OK.sfdisk"
-  fi
-}
-
-remove_backup_with_metadata_worker() {
-  local old="${1:?}"
-  [[ -f "$old" ]] || return 0
-  local old_base old_sfdisk latest_target
-  old_base="$(basename "$old")"
-  old_sfdisk="${old_base%.img*}.sfdisk"
-  latest_target=""
   if [[ -L "${BACKUP_DIR}/LATEST_OK" ]]; then
-    latest_target="$(basename "$(readlink -f "${BACKUP_DIR}/LATEST_OK" 2>/dev/null || true)")"
+    latest_target="$(readlink -f "${BACKUP_DIR}/LATEST_OK" 2>/dev/null || true)"
+    if [[ -n "$latest_target" ]]; then
+      latest_base="$(basename "$latest_target")"
+    else
+      latest_deleted=1
+    fi
   fi
-  rm -f -- "$old" "${old}.sha256" "${BACKUP_DIR}/${old_sfdisk}"
-  if [[ "$latest_target" == "$old_base" ]]; then
-    refresh_latest_ok_links_worker
+
+  for old in "$@"; do
+    [[ -f "$old" ]] || continue
+    old_base="$(basename "$old")"
+    old_sfdisk="${old_base%.img*}.sfdisk"
+    files+=("$old" "${old}.sha256" "${BACKUP_DIR}/${old_sfdisk}")
+    [[ "$old_base" == "$latest_base" ]] && latest_deleted=1
+  done
+
+  (( ${#files[@]} > 0 )) && rm -f -- "${files[@]}"
+  if (( latest_deleted )); then
+    rm -f "${BACKUP_DIR}/LATEST_OK" "${BACKUP_DIR}/LATEST_OK.sha256" "${BACKUP_DIR}/LATEST_OK.sfdisk"
   fi
 }
 
@@ -1069,24 +1106,40 @@ pve_quiesce_end() {
   if [[ "$USE_COMPRESS" == "true" && "$ENCRYPT_MODE" == "gpg" ]]; then
     msg "[*] dd | zstd | gpg | tee | sha256sum …" "[*] dd | zstd | gpg | tee | sha256sum …"
     set_status "$(status_msg "BACKUP: dd | zstd | gpg läuft..." "BACKUP: dd | zstd | gpg running...")"
-    run_active run_inhibited "Panzerbackup läuft / Panzerbackup running" bash -c '
+    if run_active run_inhibited "Panzerbackup läuft / Panzerbackup running" bash -c '
       dd if='"$DISK"' bs=64M status=progress \
       | zstd -T0 -'"$ZSTD_LEVEL"' -q \
       | gpg --batch --yes --symmetric --cipher-algo AES256 --pinentry-mode loopback --passphrase-fd 3 3<<<"'"$ENCRYPT_PASSPHRASE"'" \
       | tee "'"$TEMP_FILE"'" \
       | sha256sum -b \
       | awk '"'"'{print $1"  '"$(basename "$FINAL_FILE")"'"}'"'"' > "'"$TEMP_SHA"'"
-    '
+    '; then
+      :
+    else
+      rc=$?
+      set_status "$(status_msg "FEHLER: Backup-Stream fehlgeschlagen (RC=$rc)" "ERROR: Backup stream failed (RC=$rc)")"
+      msg "❌ Backup fehlgeschlagen: Schreib-/Stream-Fehler (RC=$rc)" "❌ Backup failed: write/stream error (RC=$rc)"
+      rm -f "$TEMP_FILE" "$TEMP_SHA" "${BACKUP_DIR}/${IMG_PREFIX}.sfdisk" "$PID_FILE"
+      exit "$rc"
+    fi
   elif [[ "$USE_COMPRESS" == "true" ]]; then
     msg "[*] dd | zstd | tee | sha256sum …" "[*] dd | zstd | tee | sha256sum …"
     set_status "$(status_msg "BACKUP: dd | zstd läuft..." "BACKUP: dd | zstd running...")"
-    run_active run_inhibited "Panzerbackup läuft / Panzerbackup running" bash -c '
+    if run_active run_inhibited "Panzerbackup läuft / Panzerbackup running" bash -c '
       dd if='"$DISK"' bs=64M status=progress \
       | zstd -T0 -'"$ZSTD_LEVEL"' -q \
       | tee "'"$TEMP_FILE"'" \
       | sha256sum -b \
       | awk '"'"'{print $1"  '"$(basename "$FINAL_FILE")"'"}'"'"' > "'"$TEMP_SHA"'"
-    '
+    '; then
+      :
+    else
+      rc=$?
+      set_status "$(status_msg "FEHLER: Backup-Stream fehlgeschlagen (RC=$rc)" "ERROR: Backup stream failed (RC=$rc)")"
+      msg "❌ Backup fehlgeschlagen: Schreib-/Stream-Fehler (RC=$rc)" "❌ Backup failed: write/stream error (RC=$rc)"
+      rm -f "$TEMP_FILE" "$TEMP_SHA" "${BACKUP_DIR}/${IMG_PREFIX}.sfdisk" "$PID_FILE"
+      exit "$rc"
+    fi
   else
     die "Interner Fehler: Kompression ist deaktiviert." "Internal error: compression is disabled."
   fi
@@ -1120,9 +1173,8 @@ pve_quiesce_end() {
   if (( ${#ALL[@]} > KEEP )); then
     for old in "${ALL[@]:$KEEP}"; do
       msg "  - Entferne alt: $old" "  - Removing old: $old"
-      remove_backup_with_metadata_worker "$old"
     done
-    refresh_latest_ok_links_worker
+    remove_backups_with_metadata_worker "${ALL[@]:$KEEP}"
   fi
 
   echo "=========================================="
@@ -1172,7 +1224,20 @@ EOFWORKER
 
 # =====================[ Backup ]==============================================
 do_backup() {
+  if ! acquire_start_lock; then
+    if is_running; then
+      msg "Ein Backup läuft bereits!" "A backup is already running!"
+      msg "Aktueller Status: $(get_status)" "Current status: $(get_status)"
+      return 1
+    fi
+    die "Backup-Start ist bereits gesperrt. Falls kein Backup läuft: sudo rm -f '$START_LOCK_PID_FILE'; sudo rmdir '$START_LOCK_DIR'" \
+        "Backup startup is already locked. If no backup is running: sudo rm -f '$START_LOCK_PID_FILE'; sudo rmdir '$START_LOCK_DIR'"
+  fi
+  trap 'release_start_lock' EXIT
+
   if is_running; then
+    release_start_lock
+    trap - EXIT
     msg "Ein Backup läuft bereits!" "A backup is already running!"
     msg "Aktueller Status: $(get_status)" "Current status: $(get_status)"
     return 1
@@ -1211,6 +1276,8 @@ do_backup() {
   msg "  - Verschlüsselung: $ENCRYPT_MODE" "  - Encryption: $ENCRYPT_MODE"
 
   do_backup_background
+  release_start_lock
+  trap - EXIT
 
   sleep 2
   if is_running; then

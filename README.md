@@ -1,6 +1,6 @@
 # 🛡️ Panzerbackup
 
-[![Version](https://img.shields.io/badge/version-2.6.5-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.6.6-blue.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 **Panzerbackup** is a disaster recovery backup script for Linux and Proxmox. It creates a **full 1:1 disk image** of your running system – comparable to Clonezilla, but fully automated and usable online (without reboot).
@@ -96,6 +96,8 @@ LANG_CHOICE=de ./panzerbackup.sh
 ### ✅ **Space Management**
 * Checks available disk space before starting backup
 * Automatically removes oldest backups if space is insufficient (`AUTO_DELETE_OLDEST=1`)
+* Selects and removes enough old backups in a batch, then verifies the available space
+* Cleanup never re-hashes large backup images; explicit verify and restore operations still validate SHA256 checksums
 * Configurable minimum free space reserve (`MIN_FREE_BYTES`, default: 2 GB)
 * Cleans up stale `.part` files from interrupted backups
 * Rotation: keeps the last *n* backups (default: 3, configurable via `KEEP`)
@@ -153,7 +155,7 @@ When launched without arguments, the script shows a full interactive menu:
 
 ```
 ╔═══════════════════════════════════════════════════╗
-║      ▄▅▆ Panzerbackup Manager v2.6.5 ▆▅▄          ║
+║      ▄▅▆ Panzerbackup Manager v2.6.6 ▆▅▄          ║
 ╚═══════════════════════════════════════════════════╝
 
 System disk: /dev/sda
