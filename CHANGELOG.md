@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here.
 
+## v2.6.7 - 2026-07-19
+
+- Automatically recover empty, malformed, and orphaned backup startup locks.
+- Preserve concurrent-start protection by allowing an active starter time to write its PID before stale-lock cleanup.
+- Keep the Linux Mint variant in sync with the main script.
+
 ## v2.6.6 - 2026-07-19
 
 - Removed full-image SHA256 scans from automatic cleanup, eliminating hour-long delays when `LATEST_OK` is deleted.

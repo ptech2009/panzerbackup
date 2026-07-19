@@ -1,6 +1,6 @@
 # 🛡️ Panzerbackup
 
-[![Version](https://img.shields.io/badge/version-2.6.6-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.6.7-blue.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 **Panzerbackup** is a disaster recovery backup script for Linux and Proxmox. It creates a **full 1:1 disk image** of your running system – comparable to Clonezilla, but fully automated and usable online (without reboot).
@@ -155,7 +155,7 @@ When launched without arguments, the script shows a full interactive menu:
 
 ```
 ╔═══════════════════════════════════════════════════╗
-║      ▄▅▆ Panzerbackup Manager v2.6.6 ▆▅▄          ║
+║      ▄▅▆ Panzerbackup Manager v2.6.7 ▆▅▄          ║
 ╚═══════════════════════════════════════════════════╝
 
 System disk: /dev/sda

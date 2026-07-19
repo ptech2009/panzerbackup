@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="2.6.6"
+VERSION="2.6.7"
 
 # =====[ Sane defaults for env -i + set -u ]===================================
 : "${LC_ALL:=C}"; export LC_ALL
@@ -155,24 +155,36 @@ is_running() {
   return 1
 }
 
+create_start_lock() {
+  mkdir "$START_LOCK_DIR" 2>/dev/null || return 1
+  if ! printf '%s\n' "$$" > "$START_LOCK_PID_FILE"; then
+    rmdir "$START_LOCK_DIR" 2>/dev/null || true
+    return 1
+  fi
+}
+
 acquire_start_lock() {
-  local owner=""
-  if mkdir "$START_LOCK_DIR" 2>/dev/null; then
-    echo "$$" > "$START_LOCK_PID_FILE"
-    return 0
+  local owner="" attempt
+  create_start_lock && return 0
+
+  # A concurrent starter may be between mkdir and writing its PID. Give it a
+  # brief chance to finish before treating a lock without metadata as stale.
+  for (( attempt=0; attempt<5; attempt++ )); do
+    if [[ -f "$START_LOCK_PID_FILE" ]]; then
+      owner="$(cat "$START_LOCK_PID_FILE" 2>/dev/null || true)"
+      break
+    fi
+    sleep 0.1
+  done
+
+  if [[ "$owner" =~ ^[0-9]+$ ]] && kill -0 "$owner" 2>/dev/null; then
+    return 1
   fi
 
-  if [[ -f "$START_LOCK_PID_FILE" ]]; then
-    owner="$(cat "$START_LOCK_PID_FILE" 2>/dev/null || true)"
-  fi
-  if [[ "$owner" =~ ^[0-9]+$ ]] && ! kill -0 "$owner" 2>/dev/null; then
-    rm -f "$START_LOCK_PID_FILE"
-    if rmdir "$START_LOCK_DIR" 2>/dev/null && mkdir "$START_LOCK_DIR" 2>/dev/null; then
-      echo "$$" > "$START_LOCK_PID_FILE"
-      return 0
-    fi
-  fi
-  return 1
+  # Recover locks left empty, malformed, or owned by a process that exited.
+  rm -f "$START_LOCK_PID_FILE" || return 1
+  rmdir "$START_LOCK_DIR" 2>/dev/null || return 1
+  create_start_lock
 }
 
 release_start_lock() {
@@ -907,7 +919,7 @@ do_backup_background() {
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="2.6.6"
+VERSION="2.6.7"
 set -E
 trap 'rc=$?; if [[ "${LANG_CHOICE:-de}" == "de" ]]; then set_status "FEHLER: Backup abgebrochen (RC=$rc)"; else set_status "ERROR: Backup aborted (RC=$rc)"; fi; echo "ERROR (Backup Worker) line $LINENO: $BASH_COMMAND (RC=$rc)"; exit $rc' ERR
 
