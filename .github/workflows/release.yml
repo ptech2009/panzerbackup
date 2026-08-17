@@ -50,7 +50,10 @@ jobs:
               --notes-file release-notes.md
           fi
 
+      # Opt-in: set the repository variable PUBLISH_CODEBERG to 1 to mirror
+      # releases to Codeberg. Without it, a tag push only releases on GitHub.
       - name: Create Codeberg Release
+        if: vars.PUBLISH_CODEBERG == '1'
         env:
           CODEBERG_TOKEN: ${{ secrets.CODEBERG_TOKEN }}
           CODEBERG_OWNER: Ptech09
