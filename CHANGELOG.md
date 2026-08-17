@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented here.
 
+## v2.6.8 - 2026-08-17
+
+- Space check now estimates the real backup size instead of demanding the full raw disk size: the source disk is sampled (default 64 x 8 MiB) and compressed with the configured zstd level to measure the actual ratio.
+- Added `SPACE_ESTIMATE_MODE`, `SPACE_SAMPLE_COUNT`, `SPACE_SAMPLE_CHUNK_MIB`, and `SPACE_SAFETY_PERCENT` (default safety margin: 15 %) plus the `--no-space-estimate` flag for the previous strict behaviour.
+- Added `--force-space` / `ALLOW_LOW_SPACE=1` to start a backup despite a failed space check; the stream still aborts cleanly on ENOSPC.
+- Low-space aborts now explain why raw images of LUKS-encrypted disks hardly compress and list the available options.
+- Kept the Linux Mint variant in sync with the main script.
+
 ## v2.6.7 - 2026-07-19
 
 - Automatically recover empty, malformed, and orphaned backup startup locks.

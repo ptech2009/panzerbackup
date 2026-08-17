@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="2.6.7"
+VERSION="2.6.8"
 
 # =====[ Sane defaults for env -i + set -u ]===================================
 : "${LC_ALL:=C}"; export LC_ALL
@@ -558,11 +558,99 @@ human_bytes() {
   fi
 }
 
-estimate_required_backup_bytes() {
+# Misst die tatsächlich zu erwartende zstd-Kompressionsrate anhand von
+# Stichproben der Quell-Disk. Ausgabe: Rate in Promille (1000 = keine Kompression).
+sample_compression_permille() {
+  local dev="${1:?}" raw="${2:?}"
+  local samples="${SPACE_SAMPLE_COUNT:-64}"
+  local chunk_mib="${SPACE_SAMPLE_CHUNK_MIB:-8}"
+  local chunk tmp step offset got comp raw_total=0 comp_total=0 i
+
+  has_cmd zstd || return 1
+  has_cmd stat || return 1
+  [[ -r "$dev" ]] || return 1
+
+  chunk=$(( chunk_mib * 1024 * 1024 ))
+  (( samples > 0 && chunk > 0 && raw > chunk )) || return 1
+  (( samples * chunk > raw )) && samples=$(( raw / chunk ))
+  (( samples > 0 )) || return 1
+
+  tmp="$(mktemp "${TMPDIR:-/tmp}/panzerbackup-sample.XXXXXX")" || return 1
+  step=$(( (raw - chunk) / samples ))
+
+  for (( i = 0; i < samples; i++ )); do
+    offset=$(( step * i ))
+    dd if="$dev" of="$tmp" bs="$chunk" count=1 skip="$offset" \
+       iflag=skip_bytes,fullblock status=none 2>/dev/null || { rm -f -- "$tmp"; return 1; }
+    got="$(stat -c '%s' -- "$tmp" 2>/dev/null || echo 0)"
+    [[ "$got" =~ ^[0-9]+$ ]] || got=0
+    (( got > 0 )) || continue
+    comp="$(zstd -T0 -"${ZSTD_LEVEL:-6}" -q -c -- "$tmp" 2>/dev/null | wc -c || true)"
+    [[ "$comp" =~ ^[0-9]+$ ]] || { rm -f -- "$tmp"; return 1; }
+    raw_total=$(( raw_total + got ))
+    comp_total=$(( comp_total + comp ))
+  done
+  rm -f -- "$tmp"
+
+  (( raw_total > 0 )) || return 1
+  echo $(( (comp_total * 1000 + raw_total - 1) / raw_total ))
+}
+
+# Setzt SPACE_RAW_BYTES, SPACE_RATIO_PERMILLE, SPACE_IMAGE_BYTES, SPACE_REQUIRED_BYTES.
+# $1 (optional): freier Speicher am Ziel. Passt schon die Rohgröße, entfällt das Sampling.
+compute_space_requirements() {
   need_cmd blockdev
-  local raw_size
-  raw_size="$(blockdev --getsize64 "$DISK")"
-  echo $(( raw_size + MIN_FREE_BYTES ))
+  local free_hint="${1:-0}" ratio est
+
+  SPACE_RAW_BYTES="$(blockdev --getsize64 "$DISK")"
+  SPACE_RATIO_PERMILLE=""
+  SPACE_IMAGE_BYTES="$SPACE_RAW_BYTES"
+  msg "[*] Rohgröße der Disk: $(human_bytes "$SPACE_RAW_BYTES")" \
+      "[*] Raw disk size: $(human_bytes "$SPACE_RAW_BYTES")"
+
+  if (( free_hint >= SPACE_RAW_BYTES + MIN_FREE_BYTES )); then
+    SPACE_REQUIRED_BYTES=$(( SPACE_IMAGE_BYTES + MIN_FREE_BYTES ))
+    return 0
+  fi
+
+  if [[ "${USE_COMPRESS:-true}" == "true" && "${SPACE_ESTIMATE_MODE:-sample}" == "sample" ]]; then
+    msg "[*] Ermittle voraussichtliche Kompressionsrate (Stichproben von $DISK) ..." \
+        "[*] Measuring expected compression ratio (sampling $DISK) ..."
+    ratio="$(sample_compression_permille "$DISK" "$SPACE_RAW_BYTES" 2>/dev/null || true)"
+    # Nicht komprimierbare Daten (z. B. LUKS-Container) liefern knapp über 1000 ‰.
+    if [[ "$ratio" =~ ^[0-9]+$ ]] && (( ratio > 1000 )); then
+      ratio=1000
+    fi
+    if [[ "$ratio" =~ ^[0-9]+$ ]] && (( ratio > 0 && ratio <= 1000 )); then
+      SPACE_RATIO_PERMILLE="$ratio"
+      est=$(( SPACE_RAW_BYTES / 1000 * ratio ))
+      est=$(( est + est * SPACE_SAFETY_PERCENT / 100 ))
+      (( est > SPACE_RAW_BYTES )) && est="$SPACE_RAW_BYTES"
+      SPACE_IMAGE_BYTES="$est"
+      msg "[*] Gemessene Kompressionsrate: $(( ratio / 10 ))% der Rohgröße (Sicherheitsaufschlag: ${SPACE_SAFETY_PERCENT}%)" \
+          "[*] Measured compression ratio: $(( ratio / 10 ))% of raw size (safety margin: ${SPACE_SAFETY_PERCENT}%)"
+    else
+      msg "[!] Kompressionsrate nicht messbar – es wird mit der vollen Rohgröße gerechnet." \
+          "[!] Compression ratio could not be measured – falling back to full raw size."
+    fi
+  fi
+
+  SPACE_REQUIRED_BYTES=$(( SPACE_IMAGE_BYTES + MIN_FREE_BYTES ))
+}
+
+low_space_abort_or_warn() {
+  local de="${1:?}" en="${2:?}"
+  if [[ "${ALLOW_LOW_SPACE:-0}" == "1" ]]; then
+    msg "[!] $de" "[!] $en"
+    msg "[!] --force-space ist aktiv: Backup startet trotzdem und bricht ab, falls der Platz nicht reicht." \
+        "[!] --force-space is active: the backup starts anyway and aborts if space runs out."
+    return 0
+  fi
+  msg "    Hinweis: Bei verschlüsselten Disks (LUKS) lässt sich das Roh-Image kaum komprimieren." \
+      "    Note: raw images of encrypted disks (LUKS) barely compress at all."
+  msg "    Optionen: größeres Backup-Ziel, oder Start erzwingen mit --force-space bzw. ALLOW_LOW_SPACE=1." \
+      "    Options: use a larger backup target, or force the start with --force-space / ALLOW_LOW_SPACE=1."
+  die "$de" "$en"
 }
 
 list_existing_backups_oldest_first() {
@@ -626,13 +714,21 @@ remove_backups_with_metadata() {
 
 cleanup_oldest_backups_until_enough_space() {
   local required free
-  required="$(estimate_required_backup_bytes)"
-  free="$(get_free_bytes)"
 
+  free="$(get_free_bytes)"
   msg "[*] Freier Speicher auf Backup-Ziel: $(human_bytes "$free")" \
       "[*] Free space on backup target: $(human_bytes "$free")"
-  msg "[*] Benötigt (Rohgröße Disk + Reserve): $(human_bytes "$required")" \
-      "[*] Required (raw disk size + reserve): $(human_bytes "$required")"
+
+  compute_space_requirements "$free"
+  required="$SPACE_REQUIRED_BYTES"
+
+  if [[ -n "$SPACE_RATIO_PERMILLE" ]]; then
+    msg "[*] Benötigt (geschätzte Backup-Größe + Reserve): $(human_bytes "$required")" \
+        "[*] Required (estimated backup size + reserve): $(human_bytes "$required")"
+  else
+    msg "[*] Benötigt (Rohgröße Disk + Reserve): $(human_bytes "$required")" \
+        "[*] Required (raw disk size + reserve): $(human_bytes "$required")"
+  fi
 
   if (( free >= required )); then
     msg "[✓] Genug Speicherplatz vorhanden." "[✓] Enough free space available."
@@ -640,8 +736,9 @@ cleanup_oldest_backups_until_enough_space() {
   fi
 
   [[ "$AUTO_DELETE_OLDEST" == "1" ]] || \
-    die "Zu wenig Speicherplatz auf dem Backup-Ziel und automatisches Löschen ist deaktiviert." \
+    low_space_abort_or_warn "Zu wenig Speicherplatz auf dem Backup-Ziel und automatisches Löschen ist deaktiviert." \
         "Not enough free space on backup target and automatic deletion is disabled."
+  [[ "$AUTO_DELETE_OLDEST" == "1" ]] || return 0
   need_cmd stat
 
   msg "[!] Zu wenig Speicherplatz. Älteste Backups werden automatisch entfernt..." \
@@ -650,9 +747,11 @@ cleanup_oldest_backups_until_enough_space() {
   local old old_bytes free_now bytes_needed estimated index=0
   local -a DELETE_BATCH=()
   mapfile -t OLD_BACKUPS < <(list_existing_backups_oldest_first)
-  (( ${#OLD_BACKUPS[@]} > 0 )) || \
-    die "Kein altes Backup zum Löschen vorhanden, aber zu wenig Speicherplatz." \
+  if (( ${#OLD_BACKUPS[@]} == 0 )); then
+    low_space_abort_or_warn "Kein altes Backup zum Löschen vorhanden, aber zu wenig Speicherplatz." \
         "No old backup available for deletion, but there is not enough free space."
+    return 0
+  fi
 
   free_now="$free"
   while (( free_now < required && index < ${#OLD_BACKUPS[@]} )); do
@@ -688,7 +787,7 @@ cleanup_oldest_backups_until_enough_space() {
   fi
 
   free_now="$(get_free_bytes)"
-  die "Trotz Löschen alter Backups nicht genug Speicher frei. Frei: $(human_bytes "$free_now"), benötigt: $(human_bytes "$required")" \
+  low_space_abort_or_warn "Trotz Löschen alter Backups nicht genug Speicher frei. Frei: $(human_bytes "$free_now"), benötigt: $(human_bytes "$required")" \
       "Still not enough free space after deleting old backups. Free: $(human_bytes "$free_now"), required: $(human_bytes "$required")"
 }
 
@@ -720,6 +819,15 @@ PROTECTED_DISKS="${BACKUP_DISK:-} ${LIVE_ROOT_DISK:-} ${SCRIPT_SOURCE_DISK:-}"
 KEEP="${KEEP:-3}"
 MIN_FREE_BYTES="${MIN_FREE_BYTES:-2147483648}"
 AUTO_DELETE_OLDEST="${AUTO_DELETE_OLDEST:-1}"
+SPACE_ESTIMATE_MODE="${SPACE_ESTIMATE_MODE:-sample}"   # sample | raw
+SPACE_SAMPLE_COUNT="${SPACE_SAMPLE_COUNT:-64}"
+SPACE_SAMPLE_CHUNK_MIB="${SPACE_SAMPLE_CHUNK_MIB:-8}"
+SPACE_SAFETY_PERCENT="${SPACE_SAFETY_PERCENT:-15}"
+ALLOW_LOW_SPACE="${ALLOW_LOW_SPACE:-0}"
+SPACE_RAW_BYTES=0
+SPACE_RATIO_PERMILLE=""
+SPACE_IMAGE_BYTES=0
+SPACE_REQUIRED_BYTES=0
 DATE="$(date +'%Y-%m-%d_%H-%M-%S')"
 BACKUP_NAME="${BACKUP_NAME:-}"
 IMG_PREFIX=""
@@ -796,6 +904,8 @@ parse_backup_flags() {
       stop) do_stop; exit 0 ;;
       --compress) COMPRESS_MODE="on"; shift ;;
       --zstd-level) ZSTD_LEVEL="${2:-6}"; shift 2 ;;
+      --force-space) ALLOW_LOW_SPACE="1"; shift ;;
+      --no-space-estimate) SPACE_ESTIMATE_MODE="raw"; shift ;;
       --post) POST_ACTION="${2:-none}"; POST_ACTION_PRESET="1"; shift 2 ;;
       --encrypt) ENCRYPT_MODE="gpg"; shift ;;
       --no-encrypt) ENCRYPT_MODE="off"; shift ;;
@@ -919,7 +1029,7 @@ do_backup_background() {
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="2.6.7"
+VERSION="2.6.8"
 set -E
 trap 'rc=$?; if [[ "${LANG_CHOICE:-de}" == "de" ]]; then set_status "FEHLER: Backup abgebrochen (RC=$rc)"; else set_status "ERROR: Backup aborted (RC=$rc)"; fi; echo "ERROR (Backup Worker) line $LINENO: $BASH_COMMAND (RC=$rc)"; exit $rc' ERR
 
@@ -1643,7 +1753,7 @@ Erkannt:
   Live-System: $([[ "$LIVE_ENV" -eq 1 ]] && echo ja || echo nein)
 
 Aufruf:
-  $0 backup  [--name NAME] [--compress] [--zstd-level N] [--encrypt|--no-encrypt] [--passfile FILE] [--post reboot|shutdown|none] [--select-backup] [--disk /dev/XYZ]
+  $0 backup  [--name NAME] [--compress] [--zstd-level N] [--encrypt|--no-encrypt] [--passfile FILE] [--post reboot|shutdown|none] [--select-backup] [--disk /dev/XYZ] [--force-space] [--no-space-estimate]
   $0 restore [--dry-run] [--select-disk] [--target /dev/sdX] [--post reboot|shutdown|none] [--passfile FILE] [--select-backup] [--disk /dev/XYZ]
   $0 verify
   $0 status
@@ -1654,6 +1764,11 @@ Aufruf:
 Environment:
   MIN_FREE_BYTES=2147483648
   AUTO_DELETE_OLDEST=1
+  SPACE_ESTIMATE_MODE=sample     # sample = Kompression messen, raw = Rohgröße verlangen
+  SPACE_SAMPLE_COUNT=64          # Anzahl Stichproben
+  SPACE_SAMPLE_CHUNK_MIB=8       # Größe je Stichprobe in MiB
+  SPACE_SAFETY_PERCENT=15        # Sicherheitsaufschlag auf die Schätzung
+  ALLOW_LOW_SPACE=0              # 1 = Backup trotz zu wenig Platz starten
   LIVE_LOG_LINES=20
   LOG_VIEW_LINES_DEFAULT=100
   MENU_REFRESH_SECONDS=2
@@ -1667,7 +1782,7 @@ Detected:
   Live system:  $([[ "$LIVE_ENV" -eq 1 ]] && echo yes || echo no)
 
 Usage:
-  $0 backup  [--name NAME] [--compress] [--zstd-level N] [--encrypt|--no-encrypt] [--passfile FILE] [--post reboot|shutdown|none] [--select-backup] [--disk /dev/XYZ]
+  $0 backup  [--name NAME] [--compress] [--zstd-level N] [--encrypt|--no-encrypt] [--passfile FILE] [--post reboot|shutdown|none] [--select-backup] [--disk /dev/XYZ] [--force-space] [--no-space-estimate]
   $0 restore [--dry-run] [--select-disk] [--target /dev/sdX] [--post reboot|shutdown|none] [--passfile FILE] [--select-backup] [--disk /dev/XYZ]
   $0 verify
   $0 status
@@ -1678,6 +1793,11 @@ Usage:
 Environment:
   MIN_FREE_BYTES=2147483648
   AUTO_DELETE_OLDEST=1
+  SPACE_ESTIMATE_MODE=sample     # sample = measure compression, raw = require raw size
+  SPACE_SAMPLE_COUNT=64          # number of samples
+  SPACE_SAMPLE_CHUNK_MIB=8       # size per sample in MiB
+  SPACE_SAFETY_PERCENT=15        # safety margin on top of the estimate
+  ALLOW_LOW_SPACE=0              # 1 = start backup despite insufficient space
   LIVE_LOG_LINES=20
   LOG_VIEW_LINES_DEFAULT=100
   MENU_REFRESH_SECONDS=2

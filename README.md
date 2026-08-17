@@ -1,6 +1,6 @@
 # 🛡️ Panzerbackup
 
-[![Version](https://img.shields.io/badge/version-2.6.7-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.6.8-blue.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 **Panzerbackup** is a disaster recovery backup script for Linux and Proxmox. It creates a **full 1:1 disk image** of your running system – comparable to Clonezilla, but fully automated and usable online (without reboot).
@@ -95,6 +95,10 @@ LANG_CHOICE=de ./panzerbackup.sh
 
 ### ✅ **Space Management**
 * Checks available disk space before starting backup
+* Estimates the real backup size by sampling the source disk and measuring the actual zstd ratio (`SPACE_ESTIMATE_MODE=sample`), instead of demanding the full raw disk size
+* Adds a configurable safety margin on top of the estimate (`SPACE_SAFETY_PERCENT`, default: 15)
+* `--force-space` / `ALLOW_LOW_SPACE=1` starts the backup even if the estimate says it will not fit
+* `--no-space-estimate` / `SPACE_ESTIMATE_MODE=raw` restores the strict raw-size check
 * Automatically removes oldest backups if space is insufficient (`AUTO_DELETE_OLDEST=1`)
 * Selects and removes enough old backups in a batch, then verifies the available space
 * Cleanup never re-hashes large backup images; explicit verify and restore operations still validate SHA256 checksums
@@ -155,7 +159,7 @@ When launched without arguments, the script shows a full interactive menu:
 
 ```
 ╔═══════════════════════════════════════════════════╗
-║      ▄▅▆ Panzerbackup Manager v2.6.7 ▆▅▄          ║
+║      ▄▅▆ Panzerbackup Manager v2.6.8 ▆▅▄          ║
 ╚═══════════════════════════════════════════════════╝
 
 System disk: /dev/sda
@@ -336,6 +340,8 @@ The stop command terminates the complete background worker process group. This p
 | `--post reboot\|shutdown\|none` | Action after backup |
 | `--disk /dev/XYZ` | Override system disk detection |
 | `--select-backup` | Show menu if multiple backup targets found |
+| `--force-space` | Start even if the space check says the backup will not fit |
+| `--no-space-estimate` | Skip compression sampling and require the full raw disk size |
 
 **Restore:**
 | Flag | Description |
@@ -530,7 +536,25 @@ MIN_FREE_BYTES=4294967296 ./panzerbackup.sh backup
 
 # Disable automatic deletion of old backups on low space
 AUTO_DELETE_OLDEST=0 ./panzerbackup.sh backup
+
+# Space check: measure compression by sampling (default) or require the raw size
+SPACE_ESTIMATE_MODE=raw ./panzerbackup.sh backup
+
+# Sampling detail: number of samples and size per sample (default: 64 x 8 MiB)
+SPACE_SAMPLE_COUNT=128 SPACE_SAMPLE_CHUNK_MIB=16 ./panzerbackup.sh backup
+
+# Safety margin added to the estimated backup size (percent, default: 15)
+SPACE_SAFETY_PERCENT=25 ./panzerbackup.sh backup
+
+# Start the backup even if the space check fails (aborts later if space runs out)
+ALLOW_LOW_SPACE=1 ./panzerbackup.sh backup
 ```
+
+> **Note on encrypted disks:** a raw image of a LUKS-encrypted disk barely compresses,
+> because unused areas contain ciphertext rather than zeros. The sampling check reports
+> this honestly (ratio close to 100 %), so a backup target smaller than the source disk
+> will legitimately be rejected. Regions that were never written since LUKS setup
+> (and TRIMmed areas, if discard is passed through) do read back as zeros and compress well.
 
 ### Environment File for Systemd
 
