@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="2.6.8"
+VERSION="2.7.0"
 
 # =====[ Sane defaults for env -i + set -u ]===================================
 : "${LC_ALL:=C}"; export LC_ALL
@@ -65,6 +65,7 @@ STARTUP_LOG="${STARTUP_LOG:-$RUN_DIR/startup.log}"
 WORKER_SCRIPT="${WORKER_SCRIPT:-$RUN_DIR/worker.sh}"
 START_TS_FILE="${START_TS_FILE:-$RUN_DIR/start_ts}"
 START_LOCK_PID_FILE="${START_LOCK_PID_FILE:-$START_LOCK_DIR/pid}"
+QUIESCE_WATCHDOG_PID_FILE="${QUIESCE_WATCHDOG_PID_FILE:-$RUN_DIR/quiesce_watchdog.pid}"
 
 set_status() { echo "$1" > "$STATUS_FILE"; }
 mark_run_started() { date +%s > "$START_TS_FILE"; }
@@ -833,6 +834,28 @@ BACKUP_NAME="${BACKUP_NAME:-}"
 IMG_PREFIX=""
 COMPRESS_MODE="on"
 ZSTD_LEVEL="${ZSTD_LEVEL:-6}"
+
+# --- Proxmox quiesce ---------------------------------------------------------
+# Guests are NOT frozen by default.
+#
+# A full-disk image of a running system is crash-consistent anyway: while "dd"
+# runs, the host's own mounted root filesystem keeps being written into the very
+# same image. Freezing the guests for the whole copy therefore buys only partial
+# consistency -- at the price of stalling every VM on the host for hours.
+#
+# That price is severe. Inside a frozen guest every write blocks in D state.
+# After ~180 s the systemd-journald watchdog fires, journald is killed and
+# restarted repeatedly, the journal gets corrupted, and services lose their log
+# socket ("Transport endpoint is not connected"). On a Proxmox Backup Server
+# guest this kills proxmox-backup-api, which exits *cleanly* -- so its
+# Restart=on-failure never brings it back and backups fail silently for days.
+#
+# Guest consistency belongs at the guest layer: vzdump/PBS freezes each VM for
+# about a second and does it correctly. Let this tool image the host instead.
+PVE_QUIESCE_MODE="${PVE_QUIESCE_MODE:-off}"        # off | freeze
+# Hard upper bound for a freeze. Must stay below journald's 180 s watchdog.
+PVE_QUIESCE_MAX_SEC="${PVE_QUIESCE_MAX_SEC:-120}"
+
 POST_ACTION="none"
 POST_ACTION_PRESET=""
 TARGET_DISK=""
@@ -913,6 +936,9 @@ parse_backup_flags() {
       --select-backup) SELECT_BACKUP="true"; shift ;;
       --disk) DISK="$2"; shift 2 ;;
       --name) BACKUP_NAME="$2"; shift 2 ;;
+      --quiesce) PVE_QUIESCE_MODE="freeze"; shift ;;
+      --no-quiesce) PVE_QUIESCE_MODE="off"; shift ;;
+      --quiesce-max-sec) PVE_QUIESCE_MAX_SEC="${2:-120}"; shift 2 ;;
       *) die "Unbekannte Backup-Option: $1" "Unknown backup option: $1" ;;
     esac
   done
@@ -1029,7 +1055,7 @@ do_backup_background() {
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="2.6.8"
+VERSION="2.7.0"
 set -E
 trap 'rc=$?; if [[ "${LANG_CHOICE:-de}" == "de" ]]; then set_status "FEHLER: Backup abgebrochen (RC=$rc)"; else set_status "ERROR: Backup aborted (RC=$rc)"; fi; echo "ERROR (Backup Worker) line $LINENO: $BASH_COMMAND (RC=$rc)"; exit $rc' ERR
 
@@ -1148,15 +1174,63 @@ remove_backups_with_metadata_worker() {
   fi
 }
 
+# The QEMU guest agent has no freeze timeout of its own: a guest stays frozen
+# until somebody calls thaw. If this worker is killed (SIGKILL, host reboot,
+# closed console) the guests would stay frozen forever. So arm a watchdog that
+# thaws unconditionally, in its own session (setsid) so that a process-group
+# kill aimed at the worker cannot take it down with it.
+arm_quiesce_watchdog() {
+  local max="$1" frozen="$2" suspended="$3" cts="$4"
+  [[ -n "${frozen}${suspended}${cts}" ]] || return 0
+
+  setsid nohup bash -c '
+    echo $$ > "$5" 2>/dev/null || true
+    sleep "$1"
+    for vm in $2; do qm agent "$vm" fsfreeze-thaw >/dev/null 2>&1 || true; done
+    for vm in $3; do qm resume "$vm"            >/dev/null 2>&1 || true; done
+    for ct in $4; do pct unfreeze "$ct"         >/dev/null 2>&1 || true; done
+    command -v logger >/dev/null 2>&1 && \
+      logger -t panzerbackup "quiesce watchdog: released freeze after ${1}s"
+  ' _ "$max" "$frozen" "$suspended" "$cts" "$QUIESCE_WATCHDOG_PID_FILE" \
+    >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+}
+
+disarm_quiesce_watchdog() {
+  local wpid
+  [[ -f "$QUIESCE_WATCHDOG_PID_FILE" ]] || return 0
+  wpid="$(cat "$QUIESCE_WATCHDOG_PID_FILE" 2>/dev/null || true)"
+  if [[ "$wpid" =~ ^[0-9]+$ ]]; then
+    kill "$wpid" >/dev/null 2>&1 || true
+  fi
+  rm -f "$QUIESCE_WATCHDOG_PID_FILE"
+}
+
 pve_quiesce_start() {
   FROZEN_QM=(); SUSPENDED_QM=(); RUN_CT=(); RUN_QM=()
+
+  if [[ "${PVE_QUIESCE_MODE:-off}" != "freeze" ]]; then
+    if has_cmd qm || has_cmd pct; then
+      msg "[*] Proxmox erkannt – Quiesce ist aus, das Abbild wird crash-konsistent." \
+          "[*] Proxmox detected – quiesce is off, the image will be crash-consistent."
+      msg "    Gastkonsistenz liefert vzdump/PBS (~1 s Freeze je VM). Erzwingen: --quiesce" \
+          "    Use vzdump/PBS for guest consistency (~1 s freeze per VM). Force with: --quiesce"
+    fi
+    return 0
+  fi
+
   if ! has_cmd qm && ! has_cmd pct; then return 0; fi
   set_status "$(status_msg "BACKUP: Proxmox VMs/CTs werden pausiert..." "BACKUP: Pausing Proxmox VMs/CTs...")"
   msg "[*] Proxmox erkannt – beginne Quiesce" "[*] Proxmox detected – starting quiesce"
+  msg "    ! Freeze wird nach ${PVE_QUIESCE_MAX_SEC}s zwangsweise geloest – alles danach" \
+      "    ! the freeze is released after ${PVE_QUIESCE_MAX_SEC}s no matter what – anything"
+  msg "    ! kopierte ist crash-konsistent. Ein voller dd-Lauf dauert laenger." \
+      "    ! copied after that is crash-consistent. A full dd run takes longer."
 
   if has_cmd qm; then
     mapfile -t RUN_QM < <(qm list 2>/dev/null | awk 'NR>1 && $3=="running"{print $1}')
     for vm in "${RUN_QM[@]:-}"; do
+      [[ -n "$vm" ]] || continue
       if qm agent "$vm" ping >/dev/null 2>&1; then
         msg "  - VM $vm: QGA ok → fsfreeze-freeze" "  - VM $vm: QGA ok → fsfreeze-freeze"
         if qm agent "$vm" fsfreeze-freeze >/dev/null 2>&1; then
@@ -1177,27 +1251,35 @@ pve_quiesce_start() {
   if has_cmd pct; then
     mapfile -t RUN_CT < <(pct list 2>/dev/null | awk 'NR>1 && $2=="running"{print $1}')
     for ct in "${RUN_CT[@]:-}"; do
+      [[ -n "$ct" ]] || continue
       msg "  - CT $ct: freeze" "  - CT $ct: freeze"
       pct freeze "$ct" >/dev/null 2>&1 || true
     done
   fi
+
+  arm_quiesce_watchdog "$PVE_QUIESCE_MAX_SEC" \
+    "${FROZEN_QM[*]:-}" "${SUSPENDED_QM[*]:-}" "${RUN_CT[*]:-}"
   trap 'pve_quiesce_end' EXIT
 }
 
 pve_quiesce_end() {
+  disarm_quiesce_watchdog
   set_status "$(status_msg "BACKUP: VMs/CTs werden fortgesetzt..." "BACKUP: Resuming VMs/CTs...")"
   if has_cmd qm; then
     for vm in "${FROZEN_QM[@]:-}"; do
+      [[ -n "$vm" ]] || continue
       msg "  - VM $vm: fsfreeze-thaw" "  - VM $vm: fsfreeze-thaw"
       qm agent "$vm" fsfreeze-thaw >/dev/null 2>&1 || true
     done
     for vm in "${SUSPENDED_QM[@]:-}"; do
+      [[ -n "$vm" ]] || continue
       msg "  - VM $vm: resume" "  - VM $vm: resume"
       qm resume "$vm" >/dev/null 2>&1 || true
     done
   fi
   if has_cmd pct; then
     for ct in "${RUN_CT[@]:-}"; do
+      [[ -n "$ct" ]] || continue
       msg "  - CT $ct: unfreeze" "  - CT $ct: unfreeze"
       pct unfreeze "$ct" >/dev/null 2>&1 || true
     done
@@ -1323,6 +1405,9 @@ EOFWORKER
     POST_ACTION="$POST_ACTION" \
     STATUS_FILE="$STATUS_FILE" PID_FILE="$PID_FILE" \
     LOG_FILE="$LOG_FILE_DEFAULT" KEEP="$KEEP" \
+    PVE_QUIESCE_MODE="$PVE_QUIESCE_MODE" \
+    PVE_QUIESCE_MAX_SEC="$PVE_QUIESCE_MAX_SEC" \
+    QUIESCE_WATCHDOG_PID_FILE="$QUIESCE_WATCHDOG_PID_FILE" \
     nohup setsid bash "$WORKER_SCRIPT" >> "$STARTUP_LOG" 2>&1 &
 
   local worker_pid=$!
@@ -1753,7 +1838,7 @@ Erkannt:
   Live-System: $([[ "$LIVE_ENV" -eq 1 ]] && echo ja || echo nein)
 
 Aufruf:
-  $0 backup  [--name NAME] [--compress] [--zstd-level N] [--encrypt|--no-encrypt] [--passfile FILE] [--post reboot|shutdown|none] [--select-backup] [--disk /dev/XYZ] [--force-space] [--no-space-estimate]
+  $0 backup  [--name NAME] [--compress] [--zstd-level N] [--encrypt|--no-encrypt] [--passfile FILE] [--post reboot|shutdown|none] [--select-backup] [--disk /dev/XYZ] [--force-space] [--no-space-estimate] [--quiesce] [--quiesce-max-sec N]
   $0 restore [--dry-run] [--select-disk] [--target /dev/sdX] [--post reboot|shutdown|none] [--passfile FILE] [--select-backup] [--disk /dev/XYZ]
   $0 verify
   $0 status
@@ -1782,7 +1867,7 @@ Detected:
   Live system:  $([[ "$LIVE_ENV" -eq 1 ]] && echo yes || echo no)
 
 Usage:
-  $0 backup  [--name NAME] [--compress] [--zstd-level N] [--encrypt|--no-encrypt] [--passfile FILE] [--post reboot|shutdown|none] [--select-backup] [--disk /dev/XYZ] [--force-space] [--no-space-estimate]
+  $0 backup  [--name NAME] [--compress] [--zstd-level N] [--encrypt|--no-encrypt] [--passfile FILE] [--post reboot|shutdown|none] [--select-backup] [--disk /dev/XYZ] [--force-space] [--no-space-estimate] [--quiesce] [--quiesce-max-sec N]
   $0 restore [--dry-run] [--select-disk] [--target /dev/sdX] [--post reboot|shutdown|none] [--passfile FILE] [--select-backup] [--disk /dev/XYZ]
   $0 verify
   $0 status

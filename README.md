@@ -106,12 +106,38 @@ LANG_CHOICE=de ./panzerbackup.sh
 * Cleans up stale `.part` files from interrupted backups
 * Rotation: keeps the last *n* backups (default: 3, configurable via `KEEP`)
 
-### ✅ **Proxmox VM/CT Quiesce**
-* Automatically freezes or suspends running VMs/containers
-* If QEMU Guest Agent is available: uses `fsfreeze` for clean, consistent snapshots
-* Falls back to suspend if QGA is not available
-* Containers: uses `pct freeze/unfreeze`
-* Automatic resume/unfreeze on backup completion or error
+### ✅ **Proxmox VM/CT Quiesce (off by default)**
+
+**Guests are not frozen unless you ask for it.** A full-disk image of a running
+system is crash-consistent regardless: while `dd` runs, the host's own mounted
+root filesystem keeps being written into the very same image. Freezing the
+guests for the whole copy buys only partial consistency — and stalls every VM
+on the host for as long as the copy takes, which is hours.
+
+That is not a theoretical cost. Inside a frozen guest every write blocks in
+D state. After roughly 180 seconds the `systemd-journald` watchdog fires,
+journald is killed and restarted over and over, the journal is corrupted, and
+services lose their log socket (`Transport endpoint is not connected`). On a
+Proxmox Backup Server guest this kills `proxmox-backup-api` — which exits
+*cleanly*, so its `Restart=on-failure` never brings it back and backups fail
+silently for days.
+
+**Get guest consistency from the guest layer instead:** `vzdump`/PBS freezes
+each VM for about a second and does it properly. Let this tool image the host.
+
+If you still want the old behaviour, `--quiesce` enables it — with a hard cap:
+
+* `--quiesce` freezes running VMs (`fsfreeze`, falling back to `qm suspend`
+  without a guest agent) and containers (`pct freeze`)
+* The freeze is released after `--quiesce-max-sec` seconds (default: 120)
+  **no matter what**. Everything copied after that point is crash-consistent.
+  The cap must stay below journald's 180 s watchdog, which is why it exists.
+* A detached watchdog process (`setsid`) performs that release. It survives
+  even a `SIGKILL` of the backup worker, a closed console, or a crashed run.
+  This matters because the QEMU guest agent has **no freeze timeout of its
+  own**: without the watchdog a guest stays frozen forever.
+* `resume-orphans` remains available to clean up guests left frozen by older
+  versions or by an unclean shutdown of the whole host.
 
 ### ✅ **SSH Session Protection**
 * Backups continue even if your SSH connection is lost (network drop, client shutdown)
@@ -221,8 +247,8 @@ Elapsed: 00:12:34
 Log (last 20 lines):
 ==========================================
 === 2025-12-23 14:30:15 | Starting panzer-backup...
-  - VM 100: QGA ok → fsfreeze-freeze
-  - VM 101: no QGA → suspend
+[*] Proxmox detected – quiesce is off, the image will be crash-consistent.
+    Use vzdump/PBS for guest consistency (~1 s freeze per VM). Force with: --quiesce
 [*] dd | zstd | tee | sha256sum …
 15360+0 records in
 15360+0 records out
@@ -342,6 +368,9 @@ The stop command terminates the complete background worker process group. This p
 | `--select-backup` | Show menu if multiple backup targets found |
 | `--force-space` | Start even if the space check says the backup will not fit |
 | `--no-space-estimate` | Skip compression sampling and require the full raw disk size |
+| `--quiesce` | Freeze Proxmox guests during the backup (off by default, see above) |
+| `--no-quiesce` | Explicitly disable guest freezing (the default) |
+| `--quiesce-max-sec N` | Hard cap for the freeze in seconds (default: 120, keep below 180) |
 
 **Restore:**
 | Flag | Description |
