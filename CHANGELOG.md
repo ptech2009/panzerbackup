@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented here.
 
+## v3.0.1 - 2026-09-04
+
+A patch release for one promise version 3.0.0 made but could not keep.
+
+- **`PVE_DR_ALLOW_SHUTDOWN=1` now reaches the shutdown path.** The preflight raised a hard finding for a VM with `freeze-fs-on-backup=0` without ever consulting the variable, and a failed preflight aborts the run long before the controlled shutdown would happen — so the documented escape hatch was unreachable. With the variable set, such a guest is now reported as a note that says what will happen to it, and the run proceeds. Without it nothing changes: the run still refuses rather than silently downgrading the guest to a crash-consistent image.
+- **State images are listed under their own count** in the data area reconciliation. They were printed below "Nicht zuordenbar" / "Unattributable", which made them read as unattributable data areas — the one thing that block exists to rule out.
+
 ## v3.0.0 - 2026-09-04
 
 **Panzerbackup 3 keeps everything that made version 2 work and changes only how the consistent state is produced.** A backup is still one file, still restored bare-metal from a Linux Mint live USB with the same script, and the RAW mode is unchanged and still the fallback for everything else.
