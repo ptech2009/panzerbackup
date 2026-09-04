@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented here.
 
+## v3.0.5 - 2026-09-04
+
+The status line was written in the language of the running job, not of the reader.
+
+- **The status is stored in both languages and picked when it is displayed.** A backup started in German kept writing German into the status file; whoever opened the menu in English afterwards read `BACKUP: Schreibe Sicherungsdatei...` under an otherwise English interface. There was a translation table for it, but it only knew the strings that existed when it was written — every status message added with the PVE-DR mode in 3.0.0 was missing from it, which is what a list like that always ends up doing. `status_msg` now emits both languages separated by a tab, `set_status` stores that unchanged, and the menu takes the half it needs. A new status message cannot be forgotten any more, because both languages are already at the call site.
+- **The remaining language switches at the call sites are gone.** Eighteen places built their status text with `[[ "$LANG_CHOICE" == de ]] && echo … || echo …` or with an if/else around two `set_status` calls, which stored whichever language happened to be selected. They all go through `status_msg` now.
+- **Older status files are still read correctly.** A job started by version 3.0.4 or earlier writes a single language; the translation table stays for exactly those, and the PVE-DR messages it never had were added, so a run started before the update also reads correctly in an English menu. For new messages the table is not extended any more.
+
 ## v3.0.4 - 2026-09-04
 
 The first real PVE-DR backup never got past its first snapshot.

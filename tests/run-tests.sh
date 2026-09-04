@@ -580,6 +580,46 @@ assert_eq  "Unsinn wird 1 MiB"         "$(al abc)"         "1048576"
 fi
 
 # ==============================================================================
+if want status; then
+echo; echo "== Status in beiden Sprachen =="
+extract_section "$SCRIPT" 'status_msg() {' '}'           > "$WORK/st.sh"
+extract_section "$SCRIPT" 'localize_status_text() {' '}' >> "$WORK/st.sh"
+st() { # $1=Sprache  $2=Rohzeile
+  ( LANG_CHOICE="$1"; source "$WORK/st.sh"; localize_status_text "$2" )
+}
+
+both="$( ( source "$WORK/st.sh"; status_msg "BACKUP: Schreibe Sicherungsdatei..." "BACKUP: Writing backup file..." ) )"
+assert_grep "status_msg legt beide Sprachen ab" "$(printf '%s' "$both" | tr '\t' '|')" \
+  'BACKUP: Schreibe Sicherungsdatei\.\.\.\|BACKUP: Writing backup file'
+assert_eq "die Sprache des Laufs spielt keine Rolle" \
+  "$( ( LANG_CHOICE=en; source "$WORK/st.sh"; status_msg "de-Text" "en-Text" ) )" \
+  "$( ( LANG_CHOICE=de; source "$WORK/st.sh"; status_msg "de-Text" "en-Text" ) )"
+
+assert_eq "deutsches Menü zeigt Deutsch" "$(st de "$both")" "BACKUP: Schreibe Sicherungsdatei..."
+assert_eq "englisches Menü zeigt Englisch" "$(st en "$both")" "BACKUP: Writing backup file..."
+
+# Genau der gemeldete Fall: Lauf auf Deutsch gestartet, Menü auf Englisch.
+assert_grep "kein deutscher Rest im englischen Menü" "$(st en "$both")" '^BACKUP: Writing'
+assert_eq "und kein Tabulator in der Anzeige" "$(printf '%s' "$(st en "$both")" | grep -c $'\t')" "0"
+
+# Altfall: eine einsprachige Statusdatei einer früheren Version.
+assert_eq "alte Statusdatei wird übersetzt" \
+  "$(st en 'BACKUP: Schreibe Sicherungsdatei...')" "BACKUP: Writing backup file..."
+assert_eq "alte Statusdatei bleibt auf Deutsch deutsch" \
+  "$(st de 'BACKUP: Schreibe Sicherungsdatei...')" "BACKUP: Schreibe Sicherungsdatei..."
+assert_eq "Unbekanntes wird unverändert durchgereicht" \
+  "$(st en 'BACKUP: Etwas ganz Neues')" "BACKUP: Etwas ganz Neues"
+
+# Einsprachig aufgerufen bleibt der Text in beiden Hälften gleich.
+one="$( ( source "$WORK/st.sh"; status_msg "nur eins" ) )"
+assert_eq "einsprachiger Aufruf: DE-Hälfte" "$(st de "$one")" "nur eins"
+assert_eq "einsprachiger Aufruf: EN-Hälfte" "$(st en "$one")" "nur eins"
+
+assert_grep "keine set_status-Aufrufe mehr mit Sprachweiche" \
+  "$(grep -cF 'set_status "$( [[' "$SCRIPT")" '^0$'
+fi
+
+# ==============================================================================
 if want cli; then
 echo; echo "== Kommandozeile und RAW-Regression =="
 C="$WORK/cli"; mkdir -p "$C/run" "$C/bak"

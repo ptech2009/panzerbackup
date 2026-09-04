@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="3.0.4"
+VERSION="3.0.5"
 
 # =====[ Sane defaults for env -i + set -u ]===================================
 : "${LC_ALL:=C}"; export LC_ALL
@@ -53,7 +53,12 @@ ASK() {
 die() { M "❌ $1" "❌ $2" >&2; exit 1; }
 msg() { M "$1" "$2"; }
 have_tty() { : </dev/tty >/dev/tty 2>/dev/null; }
-status_msg() { if [[ "$LANG_CHOICE" == "de" ]]; then printf '%s' "$1"; else printf '%s' "$2"; fi; }
+# Der Status wird zweisprachig abgelegt (deutsch<TAB>englisch) und erst beim
+# Anzeigen ausgewählt. Andernfalls steht in der Statusdatei die Sprache, in der
+# der Lauf gestartet wurde - wer das Menü später auf Englisch öffnet, läse dann
+# deutschen Text, und jede neue Statusmeldung müsste in eine Übersetzungsliste
+# eingetragen werden, was zuverlässig vergessen wird.
+status_msg() { printf '%s\t%s' "$1" "${2:-$1}"; }
 need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Benötigtes Kommando fehlt: $1" "Required command missing: $1"; }
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
 
@@ -105,6 +110,28 @@ format_elapsed() {
 }
 localize_status_text() {
   local s="${1:-}"
+
+  # Zweisprachig abgelegt: die passende Hälfte nehmen, fertig.
+  if [[ "$s" == *$'\t'* ]]; then
+    if [[ "$LANG_CHOICE" == "de" ]]; then printf '%s\n' "${s%%$'\t'*}"
+    else                                  printf '%s\n' "${s#*$'\t'}"; fi
+    return 0
+  fi
+
+  # Einsprachig - eine ältere Statusdatei oder ein Lauf einer früheren Version.
+  # Diese Liste bedient nur noch solche Altfälle (bis v3.0.4) und wächst für
+  # neue Meldungen nicht mehr mit; die stehen zweisprachig in der Datei.
+  if [[ "$LANG_CHOICE" == "en" ]]; then
+    s="${s//Schreibe Sicherungsdatei.../Writing backup file...}"
+    s="${s//Erzeuge Momentaufnahme des Systems.../Creating system snapshot...}"
+    s="${s//Momentaufnahme /Snapshot }"
+    s="${s//Baue Speicherstruktur auf.../Building the storage layout...}"
+    s="${s//Prüfe die Sicherungsdatei.../Verifying the backup file...}"
+    s="${s//Prüfe das System.../Checking the system...}"
+    s="${s//Sammle Systeminformationen.../Collecting system information...}"
+    s="${s//Wird gestartet.../Starting...}"
+    s="${s//GESTOPPT: Manuell abgebrochen/STOPPED: Aborted manually}"
+  fi
 
   if [[ "$LANG_CHOICE" == "en" ]]; then
     s="${s//Proxmox VMs\/CTs werden pausiert.../Pausing Proxmox VMs\/CTs...}"
@@ -1194,11 +1221,7 @@ do_stop() {
 
   rm -f "$PID_FILE"
   clear_passphrase_file
-  if [[ "$LANG_CHOICE" == "de" ]]; then
-    set_status "GESTOPPT: Manuell abgebrochen"
-  else
-    set_status "STOPPED: Aborted manually"
-  fi
+  set_status "$(status_msg "GESTOPPT: Manuell abgebrochen" "STOPPED: Aborted manually")"
   resume_orphans
   msg "${R}Vorgang gestoppt.${NC}" "${R}Job stopped.${NC}"
 }
@@ -2587,7 +2610,7 @@ pve_dr_backup_background() {
   echo "$wpid" > "$PID_FILE"
   sleep 2
   if ! (ps -p "$wpid" >/dev/null 2>&1 || pgrep -P "$wpid" >/dev/null 2>&1); then
-    set_status "$( [[ "$LANG_CHOICE" == de ]] && echo "FEHLER: Start fehlgeschlagen – siehe $STARTUP_LOG" || echo "ERROR: start failed – see $STARTUP_LOG" )"
+    set_status "$(status_msg "FEHLER: Start fehlgeschlagen – siehe $STARTUP_LOG" "ERROR: start failed – see $STARTUP_LOG")"
     msg "⚠️  Der Sicherungsvorgang konnte nicht gestartet werden." "⚠️  The backup job could not be started."
     [[ -s "$STARTUP_LOG" ]] && cat "$STARTUP_LOG"
     return 1
@@ -3389,7 +3412,7 @@ pve_dr_cleanup() {
 pve_dr_fail() {
   local de="${1:?}" en="${2:-$1}"
   pbdr_log "FEHLER: $de" "ERROR: $en"
-  set_status "$( [[ "$LANG_CHOICE" == de ]] && echo "FEHLER: $de" || echo "ERROR: $en" )"
+  set_status "$(status_msg "FEHLER: $de" "ERROR: $en")"
   pve_dr_cleanup
   return 1
 }
@@ -4360,26 +4383,22 @@ verify_dispatch() {
 
 # =====================[ Backup Worker ]=======================================
 do_backup_background() {
-  if [[ "$LANG_CHOICE" == "de" ]]; then
-    set_status "BACKUP: Wird gestartet..."
-  else
-    set_status "BACKUP: Starting..."
-  fi
+  set_status "$(status_msg "BACKUP: Wird gestartet..." "BACKUP: Starting...")"
 
   cat > "$WORKER_SCRIPT" << 'EOFWORKER'
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="3.0.4"
+VERSION="3.0.5"
 set -E
-trap 'rc=$?; if [[ "${LANG_CHOICE:-de}" == "de" ]]; then set_status "FEHLER: Backup abgebrochen (RC=$rc)"; else set_status "ERROR: Backup aborted (RC=$rc)"; fi; echo "ERROR (Backup Worker) line $LINENO: $BASH_COMMAND (RC=$rc)"; exit $rc' ERR
+trap 'rc=$?; set_status "$(status_msg "FEHLER: Backup abgebrochen (RC=$rc)" "ERROR: Backup aborted (RC=$rc)")"; echo "ERROR (Backup Worker) line $LINENO: $BASH_COMMAND (RC=$rc)"; exit $rc' ERR
 
 export LC_ALL=C
 : "${PATH:=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
 
 set_status() { echo "$1" > "$STATUS_FILE"; }
 msg() { if [[ "${LANG_CHOICE:-de}" == "de" ]]; then echo "$1"; else echo "$2"; fi; }
-status_msg() { if [[ "${LANG_CHOICE:-de}" == "de" ]]; then echo "$1"; else echo "$2"; fi; }
+status_msg() { printf '%s\t%s' "$1" "${2:-$1}"; }
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
 clear_passphrase_file() { rm -f -- "${PASSPHRASE_FILE:-}" 2>/dev/null || true; }
 
@@ -4771,11 +4790,7 @@ EOFWORKER
 
   sleep 2
   if ! (ps -p "$worker_pid" >/dev/null 2>&1 || pgrep -P "$worker_pid" >/dev/null 2>&1); then
-    if [[ "$LANG_CHOICE" == "de" ]]; then
-      set_status "FEHLER: Worker-Start fehlgeschlagen – siehe $STARTUP_LOG"
-    else
-      set_status "ERROR: Worker start failed – see $STARTUP_LOG"
-    fi
+    set_status "$(status_msg "FEHLER: Worker-Start fehlgeschlagen – siehe $STARTUP_LOG" "ERROR: Worker start failed – see $STARTUP_LOG")"
     msg "⚠️  WARNUNG: Worker-Prozess beendet sich sofort!" \
         "⚠️  WARNING: Worker process terminated immediately!"
     msg "   Prüfe: cat $STARTUP_LOG" \
@@ -4907,7 +4922,7 @@ do_restore() {
 
   clear_status_for_new_run
   mark_run_started
-  set_status "$( [[ "$LANG_CHOICE" == "de" ]] && echo "RESTORE: Initialisiere..." || echo "RESTORE: Initializing..." )"
+  set_status "$(status_msg "RESTORE: Initialisiere..." "RESTORE: Initializing...")"
 
   msg "=== $(date) | Starte Restore ${RESTORE_DRY_RUN:+(Dry-Run)} auf $restore_disk ===" \
       "=== $(date) | Starting restore ${RESTORE_DRY_RUN:+(dry-run)} to $restore_disk ==="
@@ -4922,10 +4937,10 @@ do_restore() {
   fi
   [[ -n "${CANDIDATE:-}" && -f "$CANDIDATE" ]] || die "Kein gültiges Backup gefunden" "No valid backup found"
   msg "[✓] Verwende: $(basename "$CANDIDATE")" "[✓] Using: $(basename "$CANDIDATE")"
-  set_status "$( [[ "$LANG_CHOICE" == "de" ]] && echo "RESTORE: Verwende $(basename "$CANDIDATE")" || echo "RESTORE: Using $(basename "$CANDIDATE")" )"
+  set_status "$(status_msg "RESTORE: Verwende $(basename "$CANDIDATE")" "RESTORE: Using $(basename "$CANDIDATE")")"
 
   if [[ "$RESTORE_DRY_RUN" == "--dry-run" ]]; then
-    set_status "$( [[ "$LANG_CHOICE" == "de" ]] && echo "RESTORE: Dry-Run abgeschlossen" || echo "RESTORE: Dry-run completed" )"
+    set_status "$(status_msg "RESTORE: Dry-Run abgeschlossen" "RESTORE: Dry-run completed")"
     if [[ -n "$restore_disk" ]]; then
       msg "[DRY-RUN] Würde $(basename "$CANDIDATE") auf $restore_disk schreiben." \
           "[DRY-RUN] Would write $(basename "$CANDIDATE") to $restore_disk."
@@ -4938,10 +4953,10 @@ do_restore() {
   fi
 
   M "⚠️  ALLE DATEN auf $restore_disk werden überschrieben!" "⚠️  ALL DATA on $restore_disk will be overwritten!"
-  ASK "Willst du das Restore wirklich starten?" "Do you really want to start the restore?" || { set_status "$( [[ "$LANG_CHOICE" == "de" ]] && echo "RESTORE: Abgebrochen" || echo "RESTORE: Aborted" )"; msg "Abbruch." "Aborted."; return 3; }
+  ASK "Willst du das Restore wirklich starten?" "Do you really want to start the restore?" || { set_status "$(status_msg "RESTORE: Abgebrochen" "RESTORE: Aborted")"; msg "Abbruch." "Aborted."; return 3; }
 
   set -o pipefail
-  set_status "$( [[ "$LANG_CHOICE" == "de" ]] && echo "RESTORE: Prüfe Checksumme..." || echo "RESTORE: Verifying checksum..." )"
+  set_status "$(status_msg "RESTORE: Prüfe Checksumme..." "RESTORE: Verifying checksum...")"
   ( cd "$BACKUP_DIR" && sha256sum -c "$(basename "$CANDIDATE").sha256" >/dev/null ) || die "Checksum-Verify fehlgeschlagen: $(basename "$CANDIDATE")" "Checksum verification failed: $(basename "$CANDIDATE")"
 
   if [[ "$CANDIDATE" == *.gpg ]]; then
@@ -4960,7 +4975,7 @@ do_restore() {
     trap 'clear_passphrase_file' EXIT INT TERM HUP
     if [[ "$CANDIDATE" == *.zst.gpg ]]; then
       msg "[*] gpg -d | zstd -d | dd …" "[*] gpg -d | zstd -d | dd …"
-      set_status "$( [[ "$LANG_CHOICE" == "de" ]] && echo "RESTORE: gpg | zstd | dd läuft..." || echo "RESTORE: gpg | zstd | dd running..." )"
+      set_status "$(status_msg "RESTORE: gpg | zstd | dd läuft..." "RESTORE: gpg | zstd | dd running...")"
       run_inhibited "Panzer-RESTORE läuft / running" \
         bash -c '
           set -o pipefail
@@ -4971,7 +4986,7 @@ do_restore() {
         ' pb-restore "$CANDIDATE" "$restore_disk" "$PASSPHRASE_FILE"
     else
       msg "[*] gpg -d | dd …" "[*] gpg -d | dd …"
-      set_status "$( [[ "$LANG_CHOICE" == "de" ]] && echo "RESTORE: gpg | dd läuft..." || echo "RESTORE: gpg | dd running..." )"
+      set_status "$(status_msg "RESTORE: gpg | dd läuft..." "RESTORE: gpg | dd running...")"
       run_inhibited "Panzer-RESTORE läuft / running" \
         bash -c '
           set -o pipefail
@@ -4985,7 +5000,7 @@ do_restore() {
   elif [[ "$CANDIDATE" == *.zst ]]; then
     need_cmd zstd
     msg "[*] zstd -d | dd …" "[*] zstd -d | dd …"
-    set_status "$( [[ "$LANG_CHOICE" == "de" ]] && echo "RESTORE: zstd | dd läuft..." || echo "RESTORE: zstd | dd running..." )"
+    set_status "$(status_msg "RESTORE: zstd | dd läuft..." "RESTORE: zstd | dd running...")"
     run_inhibited "Panzer-RESTORE läuft / running" \
       bash -c '
         set -o pipefail
@@ -4993,7 +5008,7 @@ do_restore() {
       ' pb-restore "$CANDIDATE" "$restore_disk"
   else
     msg "[*] dd (roh) …" "[*] dd (raw) …"
-    set_status "$( [[ "$LANG_CHOICE" == "de" ]] && echo "RESTORE: dd läuft..." || echo "RESTORE: dd running..." )"
+    set_status "$(status_msg "RESTORE: dd läuft..." "RESTORE: dd running...")"
     run_inhibited "Panzer-RESTORE läuft / running" dd if="$CANDIDATE" of="$restore_disk" bs=64M status=progress conv=fsync
   fi
   set +o pipefail
@@ -5023,9 +5038,9 @@ do_restore() {
     msg "[*] Restore auf anderer Disk – GRUB-Installation übersprungen." "[*] Restore to different disk – skipping GRUB installation."
   fi
 
-  set_status "$( [[ "$LANG_CHOICE" == "de" ]] && echo "RESTORE: Finalisiere..." || echo "RESTORE: Finalizing..." )"
+  set_status "$(status_msg "RESTORE: Finalisiere..." "RESTORE: Finalizing...")"
   msg "[✓] Restore abgeschlossen." "[✓] Restore completed."
-  set_status "$( [[ "$LANG_CHOICE" == "de" ]] && echo "RESTORE: Erfolgreich abgeschlossen" || echo "RESTORE: Completed successfully" )"
+  set_status "$(status_msg "RESTORE: Erfolgreich abgeschlossen" "RESTORE: Completed successfully")"
   post_action_maybe "restore"
 }
 
