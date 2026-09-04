@@ -322,6 +322,7 @@ export PB_STORAGE_CFG="$M/etc/storage.cfg"
 MM="$M"; source "$M/block.sh"; M="$MM"; PB_IS_PVE=1
 pve_dr_preflight >/dev/null 2>&1 || true
 pve_dr_report_summary 2>&1
+[[ -n "${SHOW_DETAILS:-}" ]] && pve_dr_report_details 2>&1
 EOF
   chmod +x "$M/go.sh"
   "$M/go.sh" 2>&1
@@ -334,6 +335,15 @@ mock_pve "$P/healthy" healthy;      out="$(run_preflight "$P/healthy")"
 assert_grep "freeze-fs=0 macht NICHT BEREIT"        "$out" 'NICHT BEREIT'
 assert_grep "VM 105 wird benannt"                   "$out" 'VM 105'
 assert_grep "Sicherungspunkte werden gemeldet"      "$out" 'Sicherungspunkte'
+# Regression: mit ausdrücklich erlaubtem Herunterfahren ist freeze-fs=0 kein
+# Abbruchgrund mehr, sondern ein Hinweis - sonst bliebe PVE_DR_ALLOW_SHUTDOWN=1
+# wirkungslos, weil der Preflight vor dem Herunterfahren abbricht.
+out="$(PVE_DR_ALLOW_SHUTDOWN=1 SHOW_DETAILS=1 run_preflight "$P/healthy")"
+assert_grep "freeze-fs=0 mit Shutdown-Erlaubnis ist BEREIT" "$out" 'Ergebnis: BEREIT'
+assert_grep "Shutdown der VM 105 wird angekündigt"  "$out" 'VM 105 wird für die Sicherung heruntergefahren'
+assert_grep "quiesce-Spalte zeigt den Shutdown"     "$out" 'quiesce=freeze-aus/stop'
+assert_grep "Zustandsabbilder stehen unter ihrer eigenen Zahl" \
+  "$(grep -m1 -A1 '^  Zustandsabbilder' <<<"$out" | tail -1)" 'Zustand:'
 mock_pve "$P/clean" clean;          out="$(run_preflight "$P/clean")"
 assert_grep "sauberes System ist BEREIT"            "$out" 'Ergebnis: BEREIT'
 assert_grep "7 VMs erkannt"                         "$out" 'Virtuelle Maschinen:   7'

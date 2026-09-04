@@ -1673,15 +1673,24 @@ pve_dr_check_guests() {
     if [[ "$st" == "running" && "$t" == "qemu" ]]; then
       qga="$(pve_qga_probe "$id" "$cfg")"
       if [[ "$qga" == "ok" ]] && pb_qemu_fsfreeze_disabled "$cfg"; then
-        qga="freeze-aus"
-        pb_fail "$(L "VM ${id} kann nicht konsistent gesichert werden" "VM ${id} cannot be backed up consistently")" \
-                "$(L "Für diese VM ist das Anhalten der Dateisysteme ausdrücklich abgeschaltet (Option freeze-fs-on-backup=0). Der Gastagent ist zwar erreichbar, darf die Dateisysteme aber nicht kurz anhalten - die Sicherung wäre nur so konsistent wie nach einem Stromausfall." "For this VM, pausing the filesystems is explicitly disabled (option freeze-fs-on-backup=0). The guest agent is reachable but must not pause the filesystems - the backup would only be as consistent as after a power cut.")" \
-                "$(L "Entweder die Option in der VM-Konfiguration wieder aktivieren (Optionen -> QEMU Guest Agent -> Freeze-FS-on-Backup), oder die VM für die Sicherung stoppen. Wurde sie bewusst abgeschaltet, weil der Gast das Anhalten nicht verträgt, ist diese VM für das Disaster-Recovery-Verfahren nicht geeignet." "Either re-enable the option in the VM configuration (Options -> QEMU Guest Agent -> Freeze-FS-on-Backup), or stop the VM for the backup. If it was disabled deliberately because the guest cannot tolerate the pause, this VM is not suitable for the disaster recovery procedure.")" \
-                "vmid=${id} agent has freeze-fs-on-backup=0"
+        # Mit ausdrücklich erlaubtem Herunterfahren ist dieser Gast kein
+        # Abbruchgrund: der Lauf stoppt ihn für die Momentaufnahme kontrolliert
+        # und startet ihn danach wieder (siehe pve_dr_snapshot_one_guest).
+        if [[ "${PVE_DR_ALLOW_SHUTDOWN:-0}" == "1" ]]; then
+          qga="freeze-aus/stop"
+          pb_warn "$(L "VM ${id} wird für die Sicherung heruntergefahren" "VM ${id} will be shut down for the backup")" \
+                  "$(L "Für diese VM ist das Anhalten der Dateisysteme abgeschaltet (Option freeze-fs-on-backup=0). Da das Herunterfahren von Gästen ausdrücklich erlaubt wurde (PVE_DR_ALLOW_SHUTDOWN=1), fährt der Lauf diese VM kontrolliert herunter, legt die Momentaufnahme an und startet sie danach wieder. Für die Dauer dieses Vorgangs ist sie nicht verfügbar." "For this VM, pausing the filesystems is disabled (option freeze-fs-on-backup=0). Since shutting down guests was explicitly permitted (PVE_DR_ALLOW_SHUTDOWN=1), the run shuts this VM down in a controlled way, takes the snapshot and starts it again afterwards. It is unavailable for the duration of that step.")"
+        else
+          qga="freeze-aus"
+          pb_fail "$(L "VM ${id} kann nicht konsistent gesichert werden" "VM ${id} cannot be backed up consistently")" \
+                  "$(L "Für diese VM ist das Anhalten der Dateisysteme ausdrücklich abgeschaltet (Option freeze-fs-on-backup=0). Der Gastagent ist zwar erreichbar, darf die Dateisysteme aber nicht kurz anhalten - die Sicherung wäre nur so konsistent wie nach einem Stromausfall." "For this VM, pausing the filesystems is explicitly disabled (option freeze-fs-on-backup=0). The guest agent is reachable but must not pause the filesystems - the backup would only be as consistent as after a power cut.")" \
+                  "$(L "Entweder die Option in der VM-Konfiguration wieder aktivieren (Optionen -> QEMU Guest Agent -> Freeze-FS-on-Backup), oder die VM für die Sicherung stoppen. Wurde sie bewusst abgeschaltet, weil der Gast das Anhalten nicht verträgt, ist diese VM für das Disaster-Recovery-Verfahren nicht geeignet." "Either re-enable the option in the VM configuration (Options -> QEMU Guest Agent -> Freeze-FS-on-Backup), or stop the VM for the backup. If it was disabled deliberately because the guest cannot tolerate the pause, this VM is not suitable for the disaster recovery procedure.")" \
+                  "vmid=${id} agent has freeze-fs-on-backup=0"
+        fi
       fi
       case "$qga" in
         ok) : ;;
-        freeze-aus) : ;;
+        freeze-aus|freeze-aus/stop) : ;;
         agent-disabled)
           pb_fail "$(L "VM ${id} kann nicht konsistent gesichert werden" "VM ${id} cannot be backed up consistently")" \
                   "$(L "Der QEMU-Gastagent ist für diese VM nicht aktiviert. Ohne ihn lässt sich das Dateisystem im Gast für die Momentaufnahme nicht kurz anhalten." "The QEMU guest agent is not enabled for this VM. Without it the guest filesystem cannot be paused briefly for the snapshot.")" \
@@ -2318,9 +2327,9 @@ pve_dr_report_details() {
   printf '  %-26s %s\n' "$(L 'Gastdatenträger' 'Guest volumes')"       "${#PB_VOLUMES[@]}"
   printf '  %-26s %s\n' "$(L 'Sicherungspunkte (LVM)' 'Restore points (LVM)')" "${#PB_LV_SNAPSHOTS[@]}"
   printf '  %-26s %s\n' "$(L 'Zustandsabbilder' 'State images')"       "${#PB_LV_EXTRA[@]} ($(human_bytes "${PB_EXTRA_BYTES:-0}"))"
+  for i in ${PB_LV_EXTRA[@]+"${PB_LV_EXTRA[@]}"};   do echo "      $(L 'Zustand:' 'state:  ') $i"; done
   printf '  %-26s %s\n' "$(L 'Nicht zuordenbar' 'Unattributable')"     "${#PB_LV_UNKNOWN[@]}"
-  for i in ${PB_LV_EXTRA[@]+"${PB_LV_EXTRA[@]}"};   do echo "      extra:   $i"; done
-  for i in ${PB_LV_UNKNOWN[@]+"${PB_LV_UNKNOWN[@]}"}; do echo "      unklar:  $i"; done
+  for i in ${PB_LV_UNKNOWN[@]+"${PB_LV_UNKNOWN[@]}"}; do echo "      $(L 'unklar: ' 'unknown:') $i"; done
 
   echo
   M "-- Platzbedarf --" "-- Space --"
