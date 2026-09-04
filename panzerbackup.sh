@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="3.0.3"
+VERSION="3.0.4"
 
 # =====[ Sane defaults for env -i + set -u ]===================================
 : "${LC_ALL:=C}"; export LC_ALL
@@ -1920,9 +1920,23 @@ pve_dr_check_guests() {
 }
 
 # --- COW-Planung für klassische Snapshots -----------------------------------
+# lvcreate nimmt eine Byte-Größe nur als Vielfaches von 512 an und rundet
+# danach ohnehin auf ganze Extents auf. Jede gerechnete COW-Größe wird deshalb
+# auf volle MiB abgerundet: immer durch 512 teilbar, immer innerhalb des
+# geplanten Budgets. Ein Zehntel von 96 GiB etwa ergibt 10307921510 Byte - und
+# daran ist lvcreate bisher gescheitert.
+PB_MIB=$((1024*1024))
+pb_align_mib() {
+  local b="${1:-0}"
+  [[ "$b" =~ ^[0-9]+$ ]] || b=0
+  (( b < PB_MIB )) && { printf '%s' "$PB_MIB"; return 0; }
+  printf '%s' $(( b / PB_MIB * PB_MIB ))
+}
+
 PB_COW_ROOT=0; PB_COW_TOTAL=0; PB_COW_RESERVE=0; PB_COW_BUDGET=0
 pve_cow_plan() {
   local gib=$((1024*1024*1024)) want reserve budget vg lv lvtype size extra=0 v w
+  local bmib rmib tmib
 
   (( PB_VG_FREE > 0 )) || {
     pb_fail "$(L 'Freier Platz in der Volume-Group nicht ermittelbar' 'Free space in the volume group is unknown')" \
@@ -1938,23 +1952,27 @@ pve_cow_plan() {
   want=$(( PB_ROOT_SIZE / 10 ))
   (( want < 4*gib )) && want=$(( 4*gib ))
   (( want > PB_ROOT_SIZE )) && want="$PB_ROOT_SIZE"
-  PB_COW_ROOT="$want"
+  PB_COW_ROOT="$(pb_align_mib "$want")"
 
   # Dicke (nicht-thin) Gastvolumes brauchen ebenfalls je einen klassischen COW.
   for v in ${PB_VOLUMES[@]+"${PB_VOLUMES[@]}"}; do
     IFS='|' read -r _ _ _ vg lv lvtype size _ <<< "$v"
     [[ "$lvtype" == "thick" ]] || continue
     w=$(( size / 10 )); (( w < gib )) && w=$gib
-    extra=$(( extra + w ))
+    extra=$(( extra + $(pb_align_mib "$w") ))
   done
   PB_COW_TOTAL=$(( PB_COW_ROOT + extra ))
 
   if (( PB_COW_TOTAL > budget )); then
     # proportional verkleinern, aber nie unter 2 GiB für den Root-Snapshot
     if (( budget >= 2*gib )); then
-      PB_COW_ROOT=$(( budget * PB_COW_ROOT / PB_COW_TOTAL ))
+      # In MiB rechnen: budget * PB_COW_ROOT überschreitet bei großen Volumes
+      # den 64-Bit-Bereich von bash und liefert dann Unsinn.
+      bmib=$(( budget / PB_MIB )); rmib=$(( PB_COW_ROOT / PB_MIB )); tmib=$(( PB_COW_TOTAL / PB_MIB ))
+      (( tmib > 0 )) || tmib=1
+      PB_COW_ROOT=$(( bmib * rmib / tmib * PB_MIB ))
       (( PB_COW_ROOT < 2*gib )) && PB_COW_ROOT=$(( 2*gib ))
-      PB_COW_TOTAL="$budget"
+      PB_COW_TOTAL="$(pb_align_mib "$budget")"
       pb_warn "$(L 'Snapshot-Reserve ist knapp' 'Snapshot reserve is tight')" \
               "$(L "Der geplante Snapshot-Speicher wurde auf den verfügbaren Platz in ${PB_VG} verkleinert." "The planned snapshot space was reduced to the space available in ${PB_VG}.")"
     else
@@ -2907,7 +2925,13 @@ pve_snap_create() {
       timeout 60 lvchange -ay -K "${vg}/${snap}" >/dev/null 2>&1 || rc=$?
     fi
   else
-    cow="${7:?COW-Größe fehlt}"
+    cow="${7:-}"
+    if [[ -z "$cow" ]]; then
+      # Ohne Vorgabe - ein Gastvolume auf einem dicken LV: ein Zehntel davon,
+      # mindestens 1 GiB. Ohne diesen Zweig bräche der Lauf hier ab.
+      cow=$(( size / 10 )); (( cow < 1024*1024*1024 )) && cow=$(( 1024*1024*1024 ))
+    fi
+    cow="$(pb_align_mib "$cow")"
     out="$(timeout 300 lvcreate --snapshot --name "$snap" --size "${cow}b" \
              --addtag "$PB_SNAP_TAG" "${vg}/${lv}" 2>&1)" || rc=$?
     PB_COW_LV="${vg}/${snap}"
@@ -4346,7 +4370,7 @@ do_backup_background() {
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="3.0.3"
+VERSION="3.0.4"
 set -E
 trap 'rc=$?; if [[ "${LANG_CHOICE:-de}" == "de" ]]; then set_status "FEHLER: Backup abgebrochen (RC=$rc)"; else set_status "ERROR: Backup aborted (RC=$rc)"; fi; echo "ERROR (Backup Worker) line $LINENO: $BASH_COMMAND (RC=$rc)"; exit $rc' ERR
 

@@ -516,6 +516,70 @@ assert_grep "Abbruch fragt nach dem Netz"           "$out" 'Internetverbindung'
 fi
 
 # ==============================================================================
+if want cow; then
+echo; echo "== COW-Planung (klassischer Snapshot) =="
+extract_section "$SCRIPT" 'pb_align_mib() {' '}'  > "$WORK/cow.sh"
+extract_section "$SCRIPT" 'pve_cow_plan() {' '}' >> "$WORK/cow.sh"
+
+cat > "$WORK/cowrun.sh" <<'EOF'
+set -uo pipefail
+PB_MIB=$((1024*1024))
+PB_VG=pve
+L() { echo "$1"; }
+human_bytes() { echo "$1"; }
+pb_fail() { echo "BEFUND: $1" >&2; }
+pb_warn() { echo "HINWEIS: $1" >&2; }
+source "$COW_SH"
+pve_cow_plan; rc=$?
+echo "ROOT=$PB_COW_ROOT TOTAL=$PB_COW_TOTAL RC=$rc"
+EOF
+cow_plan() { # ROOT_SIZE VG_FREE [Volume-Zeilen...]
+  local rs="$1" vf="$2"; shift 2
+  ( export COW_SH="$WORK/cow.sh"
+    PB_ROOT_SIZE="$rs" PB_VG_FREE="$vf" PB_VOLUMES=("$@")
+    export PB_ROOT_SIZE PB_VG_FREE
+    declare -p PB_VOLUMES > "$WORK/cowvols.sh"
+    "${BASH:-/bin/bash}" -c 'source "'"$WORK"'/cowvols.sh"; source "'"$WORK"'/cowrun.sh"' )
+}
+cow_field() { sed -n 's/.*\b'"$2"'=\([0-9-]*\).*/\1/p' <<<"$1"; }
+
+# Pauls Fall: 96 GiB Root-LV, 17 GiB frei in der VG. Ein Zehntel davon ist
+# 10307921510 Byte - genau daran ist lvcreate gescheitert.
+out="$(cow_plan 103079215104 18253611008 2>/dev/null)"
+root="$(cow_field "$out" ROOT)"
+assert_eq  "96-GiB-Root: COW ist durch 512 teilbar"  "$(( root % 512 ))" "0"
+assert_eq  "96-GiB-Root: COW liegt auf vollen MiB"   "$(( root % (1024*1024) ))" "0"
+assert_eq  "96-GiB-Root: erwartete Größe"            "$root" "10307502080"
+assert_eq  "96-GiB-Root: Planung meldet Erfolg"      "$(cow_field "$out" RC)" "0"
+
+# Knapper Platz: proportional verkleinert, trotzdem ausgerichtet.
+out="$(cow_plan 103079215104 5368709120 2>/dev/null)"
+root="$(cow_field "$out" ROOT)"
+assert_eq  "knapper Platz: COW durch 512 teilbar"    "$(( root % 512 ))" "0"
+assert_ok  "knapper Platz: COW bleibt im Budget"     test "$root" -le 4294967296
+
+# Große Volumes: budget * COW_ROOT überliefe 64 Bit. Das Ergebnis muss positiv
+# und kleiner als das Budget bleiben.
+out="$(cow_plan 2199023255552 268435456000 "a|b|c|pve|vm-1|thick|2199023255552|" 2>/dev/null)"
+root="$(cow_field "$out" ROOT)"
+assert_ok  "2-TiB-Volumes: COW bleibt positiv"       test "$root" -gt 0
+assert_ok  "2-TiB-Volumes: COW bleibt unter Budget"  test "$root" -lt 241591910400
+assert_eq  "2-TiB-Volumes: COW durch 512 teilbar"    "$(( root % 512 ))" "0"
+
+# Zu wenig Platz bleibt ein Befund.
+out="$(cow_plan 103079215104 1073741824 2>&1)"
+assert_grep "unter 2 GiB Budget -> Befund"           "$out" 'Zu wenig freier Platz'
+assert_eq   "unter 2 GiB Budget -> Rückgabe 1"       "$(cow_field "$out" RC)" "1"
+
+# Die Ausrichtung selbst.
+al() { ( source "$WORK/cow.sh" 2>/dev/null; PB_MIB=$((1024*1024)); pb_align_mib "$1" ); }
+assert_eq  "10307921510 -> volle MiB"  "$(al 10307921510)" "10307502080"
+assert_eq  "exaktes MiB bleibt"        "$(al 1048576)"     "1048576"
+assert_eq  "unter 1 MiB wird 1 MiB"    "$(al 4096)"        "1048576"
+assert_eq  "Unsinn wird 1 MiB"         "$(al abc)"         "1048576"
+fi
+
+# ==============================================================================
 if want cli; then
 echo; echo "== Kommandozeile und RAW-Regression =="
 C="$WORK/cli"; mkdir -p "$C/run" "$C/bak"

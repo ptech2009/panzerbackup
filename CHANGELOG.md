@@ -2,6 +2,16 @@
 
 All notable changes to this project are documented here.
 
+## v3.0.4 - 2026-09-04
+
+The first real PVE-DR backup never got past its first snapshot.
+
+- **A COW size is now a multiple of 512.** `lvcreate` accepts a byte size only in multiples of 512, and the planned size was a tenth of the root volume: for a 96 GiB root that is 10307921510 bytes, and the run ended at `Size is not a multiple of 512` before a single byte was read. Every computed COW size is now rounded down to whole MiB — always divisible by 512, always inside the planned budget, and LVM rounds up to its extent boundary as before. The alignment is applied both where the plan is made and immediately before `lvcreate`, so no caller can get it wrong.
+- **The proportional shrink no longer overflows.** When the snapshot budget was too small, the reduced size was computed as `budget * cow_root / cow_total`. With volumes in the terabyte range that product exceeds the signed 64-bit range bash calculates in, and the result was arbitrary. The same ratio is now computed in MiB.
+- **A guest volume on a thick LV can be snapshotted at all.** The classic branch demanded a COW size from its caller, but the guest loop never passed one — a host with a non-thin guest volume would have aborted with "COW size missing" mid-run, after other guests had already been frozen. Without a given size it now uses a tenth of the volume, at least 1 GiB.
+
+Tests: 152 checks, fifteen of them on the COW planning alone, including the exact 96 GiB case that failed here, the tight-space path, the terabyte case that used to overflow, and the refusal when the volume group really is too full.
+
 ## v3.0.3 - 2026-09-04
 
 A restore in an emergency should be one command.
