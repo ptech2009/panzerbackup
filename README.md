@@ -103,7 +103,9 @@ Die Backup-Platte braucht ein Dateisystem-Label, das `PANZERBACKUP` enthält.
 Panzerbackup findet und mountet sie dann selbst.
 
 **Voraussetzungen:** `bash`, `dd`, `zstd`, `sha256sum`, `sfdisk`, `lvm2`;
-für Verschlüsselung `gnupg`. Auf dem Live-System für den Restore dasselbe.
+für Verschlüsselung `gnupg`. Auf einem Live-System für den Restore fehlt davon
+meist `lvm2` — Panzerbackup installiert dort fehlende Pakete selbst nach, ohne
+zu fragen. Es genügt also, das Skript zu starten.
 
 ---
 

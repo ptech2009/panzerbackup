@@ -444,6 +444,78 @@ assert_ok  "Leerzeichen in der agent-Zeile stören nicht" wff 6
 fi
 
 # ==============================================================================
+if want tools; then
+echo; echo "== Fehlende Werkzeuge nachinstallieren =="
+extract_section "$SCRIPT" 'pkg_for_cmd() {' '}'  > "$WORK/tools.sh"
+extract_section "$SCRIPT" 'ensure_tools() {' '}' >> "$WORK/tools.sh"
+
+TB="$WORK/tbin"; mkdir -p "$TB"
+printf '#!/bin/bash\n[[ "$1" == "-u" ]] && { echo 0; exit 0; }\nexec /usr/bin/id "$@"\n' > "$TB/id"
+cat > "$TB/apt-get" <<'EOF'
+#!/bin/bash
+echo "$*" >> "$APT_MARKER"
+if [[ "$1" == install && "${APT_WORKS:-1}" == 1 ]]; then
+  for a in "$@"; do
+    [[ "$a" == lvm2 ]] && { printf '#!/bin/bash\nexit 0\n' > "$TB/lvcreate"; chmod +x "$TB/lvcreate"; }
+  done
+fi
+exit 0
+EOF
+chmod +x "$TB"/*
+
+cat > "$WORK/toolsrun.sh" <<'EOF'
+set -uo pipefail
+LANG_CHOICE=de
+M() { echo "$1"; }
+msg() { echo "$1"; }
+die() { echo "FEHLER: $1" >&2; exit 1; }
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
+have_tty() { return 1; }
+ASK() { return 1; }
+source "$TOOLS_SH"
+ensure_tools "$@"
+EOF
+run_tools() { # $1=marker  Rest: Kommandos
+  local marker="$1"; shift
+  ( export TOOLS_SH="$WORK/tools.sh" TB="$TB" APT_MARKER="$marker" PATH="$TB"
+    "${BASH:-/bin/bash}" "$WORK/toolsrun.sh" "$@" )
+}
+
+assert_eq "lvcreate gehört zu lvm2"   "$(bash -c "source '$WORK/tools.sh'; pkg_for_cmd lvcreate")" "lvm2"
+assert_eq "gpg gehört zu gnupg"       "$(bash -c "source '$WORK/tools.sh'; pkg_for_cmd gpg")"      "gnupg"
+assert_eq "partprobe gehört zu parted" "$(bash -c "source '$WORK/tools.sh'; pkg_for_cmd partprobe")" "parted"
+assert_eq "Unbekanntes bleibt leer"   "$(bash -c "source '$WORK/tools.sh'; pkg_for_cmd wurstbrot")" ""
+
+# Nichts fehlt: kein apt, kein Ton.
+M1="$WORK/apt1.log"; : > "$M1"
+assert_ok  "alles vorhanden -> Rückkehr ohne apt" run_tools "$M1" id apt-get
+assert_eq  "apt wurde nicht aufgerufen" "$(wc -l < "$M1")" "0"
+
+# Live-System: es fehlt lvcreate, das Paket wird ohne Rückfrage nachgezogen.
+M2="$WORK/apt2.log"; : > "$M2"; rm -f "$TB/lvcreate"
+out="$( LIVE_ENV=1 run_tools "$M2" lvcreate 2>&1 )"; rc=$?
+assert_eq  "Live: fehlendes lvm2 wird eingerichtet" "$rc" "0"
+assert_grep "Live: apt installiert lvm2"            "$(cat "$M2")" 'install -y lvm2'
+assert_grep "Live: der Benutzer sieht einen Satz"   "$out" 'richte es ein'
+assert_grep "Live: und die Bestätigung"             "$out" 'Bereit'
+assert_grep "Live: keine Paketliste im Normalfall"  "$(grep -c 'lvm2' <<<"$out")" '^0$'
+
+# Ohne Rückfragemöglichkeit und ohne Live-System wird nicht installiert.
+M3="$WORK/apt3.log"; : > "$M3"; rm -f "$TB/lvcreate"
+out="$( run_tools "$M3" lvcreate 2>&1 )"; rc=$?
+assert_eq  "ohne TTY: kein stilles Installieren"    "$rc" "1"
+assert_eq  "ohne TTY: apt bleibt unangetastet"      "$(wc -l < "$M3")" "0"
+assert_grep "ohne TTY: die apt-Zeile steht da"      "$out" 'apt install -y lvm2'
+
+# Scheitert die Installation, bricht es mit klarer Ansage ab.
+M4="$WORK/apt4.log"; : > "$M4"; rm -f "$TB/lvcreate"
+out="$( LIVE_ENV=1 APT_WORKS=0 run_tools "$M4" lvcreate 2>&1 )"; rc=$?
+assert_eq  "erfolglose Installation -> Abbruch"     "$rc" "1"
+assert_grep "Abbruch nennt das Fehlende"            "$out" 'lvcreate'
+assert_grep "Abbruch fragt nach dem Netz"           "$out" 'Internetverbindung'
+fi
+
+# ==============================================================================
 if want cli; then
 echo; echo "== Kommandozeile und RAW-Regression =="
 C="$WORK/cli"; mkdir -p "$C/run" "$C/bak"

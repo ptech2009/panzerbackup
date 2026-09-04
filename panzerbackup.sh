@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="3.0.2"
+VERSION="3.0.3"
 
 # =====[ Sane defaults for env -i + set -u ]===================================
 : "${LC_ALL:=C}"; export LC_ALL
@@ -574,6 +574,72 @@ ensure_zstd_if_needed() {
       die "Kompression ist erforderlich, aber zstd fehlt." "Compression is required, but zstd is missing."
     fi
   fi
+}
+
+
+# =====================[ Werkzeuge sicherstellen ]=============================
+# Ein Live-System bringt kein lvm2 mit, und ohne lvm2 kommt eine PVE-DR-
+# Wiederherstellung nicht weit. Statt mit "Benötigtes Kommando fehlt" abzubrechen
+# und den Benutzer im Notfall eine apt-Zeile abtippen zu lassen, ordnet
+# Panzerbackup fehlende Programme ihren Paketen zu und installiert sie nach.
+pkg_for_cmd() {
+  case "${1:?}" in
+    pvcreate|vgcreate|vgchange|lvcreate|lvremove|lvchange|lvconvert|lvs|vgs|pvs) echo lvm2 ;;
+    sfdisk|blkid|blockdev|lsblk|findmnt|mkswap|partx|mount) echo util-linux ;;
+    partprobe)                echo parted ;;
+    zstd)                     echo zstd ;;
+    gpg)                      echo gnupg ;;
+    dd|sha256sum|chroot)      echo coreutils ;;
+    *)                        echo "" ;;
+  esac
+}
+
+# Nimmt Kommandonamen entgegen. Fehlt keines, kehrt sie sofort zurück - der
+# Normalfall auf einem Proxmox-Host kostet also nichts.
+ensure_tools() {
+  local c p absent=() pkgs=() still=() manual
+  for c in "$@"; do has_cmd "$c" || absent+=("$c"); done
+  (( ${#absent[@]} )) || return 0
+
+  for c in ${absent[@]+"${absent[@]}"}; do
+    p="$(pkg_for_cmd "$c")"
+    [[ -n "$p" ]] || die "Benötigtes Kommando fehlt und ist keinem Paket zugeordnet: $c" \
+                        "Required command absent and mapped to no package: $c"
+    [[ " ${pkgs[*]-} " == *" $p "* ]] || pkgs+=("$p")
+  done
+  manual="apt update && apt install -y ${pkgs[*]}"
+
+  [[ "$(id -u)" == "0" ]] || die "Bitte mit sudo starten - dann richtet sich Panzerbackup selbst ein. Von Hand: $manual" \
+                                 "Please start with sudo - then Panzerbackup sets itself up. By hand: $manual"
+  has_cmd apt-get || die "Es fehlt: ${absent[*]}. Ohne apt-get bitte von Hand installieren: ${pkgs[*]}" \
+                         "Missing: ${absent[*]}. Without apt-get please install by hand: ${pkgs[*]}"
+
+  # Auf einem Live-System wird ohne Rückfrage eingerichtet: dort bleibt nichts
+  # zurück, und genau dort steht man im Notfall. Auf einem installierten System
+  # wird gefragt, weil dort Pakete dauerhaft dazukommen.
+  if [[ "${LIVE_ENV:-0}" -eq 1 ]]; then
+    msg "[*] Das Live-System bringt nicht alles mit - ich richte es ein (nur im Arbeitsspeicher) ..." \
+        "[*] The live system does not ship everything needed - setting it up (in memory only) ..."
+  elif have_tty; then
+    msg "[*] Dafür fehlen noch: ${pkgs[*]}" "[*] Still absent for this: ${pkgs[*]}"
+    ASK "Sollen diese Pakete jetzt installiert werden?" "Install these packages now?" \
+      || die "Ohne diese Pakete kann nicht fortgefahren werden: $manual" \
+             "Cannot continue without these packages: $manual"
+  else
+    die "Es fehlen Pakete und es kann nicht nachgefragt werden: $manual" \
+        "Packages are absent and there is no way to ask: $manual"
+  fi
+
+  DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null 2>&1 || true
+  DEBIAN_FRONTEND=noninteractive apt-get install -y ${pkgs[@]+"${pkgs[@]}"} >/dev/null 2>&1 || true
+
+  for c in ${absent[@]+"${absent[@]}"}; do has_cmd "$c" || still+=("$c"); done
+  if (( ${#still[@]} )); then
+    die "Die Einrichtung ist fehlgeschlagen, es fehlt weiterhin: ${still[*]}. Besteht eine Internetverbindung? Von Hand: $manual" \
+        "Setup failed, still absent: ${still[*]}. Is there an internet connection? By hand: $manual"
+  fi
+  msg "[✓] Bereit." "[✓] Ready."
+  return 0
 }
 
 # =====================[ Platzprüfung ]========================================
@@ -3612,7 +3678,7 @@ pzb_prepare_read() {
   PZB_ENC=0
   pzb_file_is_encrypted "$f" && PZB_ENC=1
   (( PZB_ENC )) || return 0
-  need_cmd gpg
+  ensure_tools gpg
   if [[ -z "${ENCRYPT_PASSPHRASE:-}" && ! -s "${PASSPHRASE_FILE:-/nonexistent}" ]]; then
     if [[ -t 0 && -t 1 ]]; then
       if [[ "$LANG_CHOICE" == "de" ]]; then read -rsp "Passphrase für diese Sicherung: " ENCRYPT_PASSPHRASE; echo
@@ -4052,8 +4118,10 @@ pbdr_restore_validate() {
 restore_pve_dr() {
   local file="${1:?}" target="" rc=0 tsize
 
-  need_cmd zstd; need_cmd sfdisk; need_cmd lvcreate; need_cmd vgcreate; need_cmd pvcreate
-  need_cmd dd; need_cmd sha256sum
+  # Auf einem Live-USB fehlt in aller Regel lvm2. Hier ist der letzte Punkt, an
+  # dem sich das noch bequem beheben lässt - danach wird geschrieben.
+  ensure_tools zstd sfdisk lvcreate vgcreate pvcreate lvchange mkswap blkid partprobe \
+               dd sha256sum blockdev
 
   pzb_prepare_read "$file" || return 1
   msg "[*] Lese den Wiederherstellungsplan ..." "[*] Reading the restore plan ..."
@@ -4278,7 +4346,7 @@ do_backup_background() {
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="3.0.2"
+VERSION="3.0.3"
 set -E
 trap 'rc=$?; if [[ "${LANG_CHOICE:-de}" == "de" ]]; then set_status "FEHLER: Backup abgebrochen (RC=$rc)"; else set_status "ERROR: Backup aborted (RC=$rc)"; fi; echo "ERROR (Backup Worker) line $LINENO: $BASH_COMMAND (RC=$rc)"; exit $rc' ERR
 
@@ -4797,7 +4865,7 @@ do_verify() {
 
 # =====================[ Restore ]=============================================
 do_restore() {
-  need_cmd dd; need_cmd sha256sum; need_cmd lsblk; need_cmd mount; need_cmd chroot
+  ensure_tools dd sha256sum lsblk mount chroot
   local restore_disk="${DISK:-}" dry_no_target=0
   if [[ -n "${TARGET_DISK:-}" ]]; then
     restore_disk="$TARGET_DISK"; [[ -b "$restore_disk" ]] || die "Angegebene Ziel-Disk nicht gefunden: $restore_disk" "Target disk not found: $restore_disk"

@@ -51,9 +51,12 @@ sudo lvs -o vg_name,lv_name,lv_tags | grep pbdr_ || echo "sauber - keine Reste"
 3. Skript von der Backup-Platte starten:
 
 ```bash
-sudo apt update && sudo apt install -y lvm2 zstd gnupg
 sudo /mnt/PANZERBACKUP/panzerbackup.sh
 ```
+
+Mehr ist nicht nötig: was dem Live-System fehlt — in aller Regel `lvm2` —
+installiert Panzerbackup dort selbst nach, ohne zu fragen. Dafür braucht die
+Live-Sitzung eine Internetverbindung.
 
 4. Im Menü: **2) Backup wiederherstellen** → `.pzb` auswählen → Zieldisk
    auswählen → bestätigen.

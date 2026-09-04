@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented here.
 
+## v3.0.3 - 2026-09-04
+
+A restore in an emergency should be one command.
+
+- **A live system sets itself up.** A Linux Mint live session ships no `lvm2`, and without `lvm2` a PVE-DR restore got no further than "required command missing" — in an emergency, standing in front of an empty disk, the fix was an `apt` line from the documentation. Panzerbackup now maps missing programs to their packages itself and installs them: on a live system without asking, because nothing there is changed permanently, on an installed system after a question. All the user sees is one sentence and a confirmation; package names and the `apt` line to type appear only when something goes wrong.
+- **The refusal stays honest.** Nothing is installed silently when there is no way to ask, and if the installation fails the message names what is still missing, asks about the internet connection and prints the exact `apt` line.
+
 ## v3.0.2 - 2026-09-04
 
 Everything in this release is about one promise: a guest whose configuration forbids freezing is never frozen. Three ways around that promise are closed.
