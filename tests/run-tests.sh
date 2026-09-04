@@ -27,6 +27,10 @@ source "$WORK/container.sh"
 if want static; then
 echo; echo "== Statische Prüfungen =="
 assert_ok  "bash -n panzerbackup.sh" bash -n "$SCRIPT"
+# Der Backup-Worker liegt in einem Heredoc - "bash -n" auf das Hauptskript
+# prüft seinen Inhalt nicht mit.
+sed -n "/<< 'EOFWORKER'$/,/^EOFWORKER$/p" "$SCRIPT" | sed '1d;$d' > "$WORK/worker.sh"
+assert_ok  "bash -n Backup-Worker (Heredoc)" bash -n "$WORK/worker.sh"
 if command -v shellcheck >/dev/null 2>&1; then
   n=$(shellcheck -S warning "$SCRIPT" 2>&1 | grep -cE 'SC[0-9]+ \(warning\)' || true)
   # SC2034 fuer die ungenutzte Farbvariable B stammt aus v2.7.0
@@ -260,8 +264,15 @@ case "\$1" in
         for v in 100 101 102 103 105 106; do echo "       \$v vm-\$v running 4096 60.00 1\$v"; done
         echo "       104 vm-104 stopped 8192 80.00 0" ;;
   config) echo "bios: ovmf"
+     cur=0; [[ "\$*" == *--current* ]] && cur=1
      case "\$2" in
-       105) [[ "${scen}" == "freezeoff" || "${scen}" == "healthy" ]] && echo "agent: 1,freeze-fs=0" || echo "agent: 1" ;;
+       105) if [[ "${scen}" == "fspending" ]]; then
+              (( cur )) && echo "agent: 1,freeze-fs=0" || echo "agent: 1"
+            elif [[ "${scen}" == "fsnewoff" ]]; then
+              (( cur )) && echo "agent: 1" || echo "agent: 1,freeze-fs=0"
+            elif [[ "${scen}" == "fsalias" ]]; then echo "agent: 1,guest-fsfreeze=0"
+            elif [[ "${scen}" == "freezeoff" || "${scen}" == "healthy" ]]; then echo "agent: 1,freeze-fs=0"
+            else echo "agent: 1"; fi ;;
        106) [[ "${scen}" == "noqga" ]] && echo "agent: 0" || echo "agent: 1" ;;
        *)   echo "agent: 1" ;;
      esac
@@ -342,8 +353,30 @@ out="$(PVE_DR_ALLOW_SHUTDOWN=1 SHOW_DETAILS=1 run_preflight "$P/healthy")"
 assert_grep "freeze-fs=0 mit Shutdown-Erlaubnis ist BEREIT" "$out" 'Ergebnis: BEREIT'
 assert_grep "Shutdown der VM 105 wird angekündigt"  "$out" 'VM 105 wird für die Sicherung heruntergefahren'
 assert_grep "quiesce-Spalte zeigt den Shutdown"     "$out" 'quiesce=freeze-aus/stop'
+assert_grep "Hinweis zitiert die gefundene Schreibweise" "$out" 'Option freeze-fs=0'
 assert_grep "Zustandsabbilder stehen unter ihrer eigenen Zahl" \
   "$(grep -m1 -A1 '^  Zustandsabbilder' <<<"$out" | tail -1)" 'Zustand:'
+# Seit PVE 9 ist "freeze-fs" der kanonische Name; "freeze-fs-on-backup" und
+# "guest-fsfreeze" sind Aliase derselben Einstellung und müssen genauso greifen.
+mock_pve "$P/fsalias" fsalias;      out="$(SHOW_DETAILS=1 run_preflight "$P/fsalias")"
+assert_grep "Alias guest-fsfreeze=0 -> NICHT BEREIT" "$out" 'NICHT BEREIT'
+assert_grep "Befund zitiert den Alias"               "$out" 'agent has guest-fsfreeze=0'
+# Eine gerade umgestellte Option greift erst beim nächsten Start der VM.
+# "qm config" zeigt sie trotzdem schon an - für einen laufenden Gast zählt aber,
+# was jetzt gilt (qm config --current).
+mock_pve "$P/fspending" fspending;  out="$(SHOW_DETAILS=1 run_preflight "$P/fspending")"
+assert_grep "anstehende Änderung macht nicht bereit" "$out" 'NICHT BEREIT'
+assert_grep "Befund nennt die laufende Einstellung"  "$out" 'agent has freeze-fs=0'
+assert_grep "Stopp und Start werden erklärt"         "$out" 'Stopp und Start'
+assert_grep "Lösung nennt den Neustart der VM"       "$out" "qm reboot 105"
+assert_grep "Lösung rät nicht zu bereits Erledigtem" \
+  "$(grep -c 'aus der Zeile' <<<"$out")" '^0$'
+# Umgekehrt: gerade abgeschaltet, die laufende VM erlaubt es noch. Die neueste
+# Ansage des Betreibers zählt genauso.
+mock_pve "$P/fsnewoff" fsnewoff;    out="$(SHOW_DETAILS=1 run_preflight "$P/fsnewoff")"
+assert_grep "frisch abgeschaltet macht nicht bereit" "$out" 'NICHT BEREIT'
+assert_grep "hier ist der übliche Rat richtig"      "$out" 'aus der Zeile'
+assert_grep "kein Stopp-und-Start-Hinweis"           "$(grep -c 'Stopp und Start' <<<"$out")" '^0$'
 mock_pve "$P/clean" clean;          out="$(run_preflight "$P/clean")"
 assert_grep "sauberes System ist BEREIT"            "$out" 'Ergebnis: BEREIT'
 assert_grep "7 VMs erkannt"                         "$out" 'Virtuelle Maschinen:   7'
@@ -369,6 +402,45 @@ mock_pve "$P/small" clean; out="$(FAKE_FREE=1000000 run_preflight "$P/small")"
 assert_grep "Backup-Ziel zu klein -> NICHT BEREIT"  "$out" 'NICHT BEREIT'
 mock_pve "$P/noroot" clean; rm -f "$P/noroot/bin/id"; out="$(run_preflight "$P/noroot")"
 assert_grep "ohne root -> NICHT BEREIT"             "$out" 'Administratorrechte'
+fi
+
+# ==============================================================================
+if want worker; then
+echo; echo "== Backup-Worker: RAW-Quiesce =="
+# Der Worker ist ein eigenständiges Skript im Heredoc und kennt die Helfer des
+# Hauptskripts nicht - er liest die Gastkonfiguration selbst.
+sed -n "/<< 'EOFWORKER'$/,/^EOFWORKER$/p" "$SCRIPT" | sed '1d;$d' > "$WORK/worker-full.sh"
+assert_grep "RAW-Quiesce fragt die VM-Konfiguration" \
+  "$(cat "$WORK/worker-full.sh")" 'qm_fsfreeze_disabled "\$vm"'
+assert_grep "RAW-Quiesce liest die aktive Konfiguration" \
+  "$(cat "$WORK/worker-full.sh")" 'qm config .* --current'
+
+WB="$WORK/wbin"; mkdir -p "$WB"
+cat > "$WB/qm" <<'EOF'
+#!/bin/bash
+[[ "$1" == config ]] || exit 0
+echo "bios: ovmf"
+case "$2" in
+  1) echo "agent: 1" ;;
+  2) echo "agent: 1,freeze-fs=0" ;;
+  3) echo "agent: 1,freeze-fs-on-backup=0" ;;
+  4) echo "agent: 1,guest-fsfreeze=0" ;;
+  5) echo "agent: enabled=1,freeze-fs=1,type=virtio" ;;
+  6) echo "agent: 1, guest-fsfreeze=0 ,type=virtio" ;;
+  7) echo "bios: ovmf" ;;
+esac
+exit 0
+EOF
+chmod +x "$WB/qm"
+extract_section "$SCRIPT" 'qm_fsfreeze_disabled() {' '}' > "$WORK/qmff.sh"
+wff() { ( PATH="$WB:$PATH"; source "$WORK/qmff.sh"; qm_fsfreeze_disabled "$1" ); }
+assert_nok "agent: 1 - Anhalten bleibt erlaubt"        wff 1
+assert_ok  "freeze-fs=0 wird erkannt"                  wff 2
+assert_ok  "Alias freeze-fs-on-backup=0 wird erkannt"  wff 3
+assert_ok  "Alias guest-fsfreeze=0 wird erkannt"       wff 4
+assert_nok "freeze-fs=1 ist kein Abschalten"           wff 5
+assert_nok "Teilstring in einem anderen Wert täuscht nicht" wff 7
+assert_ok  "Leerzeichen in der agent-Zeile stören nicht" wff 6
 fi
 
 # ==============================================================================

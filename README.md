@@ -85,7 +85,8 @@ Unterstützung.
 - LXC-Bind-Mounts und externe Mountpoints
 - mehrere Thin-Pools
 - Cluster-Knoten (Sicherung möglich, Wiederherstellung braucht Handarbeit — wird gemeldet)
-- VMs mit `freeze-fs-on-backup=0`, sofern kein Herunterfahren erlaubt wurde
+- VMs mit `freeze-fs=0` (Aliase `freeze-fs-on-backup`, `guest-fsfreeze`), sofern kein
+  Herunterfahren erlaubt wurde
 
 ---
 

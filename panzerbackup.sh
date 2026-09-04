@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="3.0.1"
+VERSION="3.0.2"
 
 # =====[ Sane defaults for env -i + set -u ]===================================
 : "${LC_ALL:=C}"; export LC_ALL
@@ -1539,6 +1539,17 @@ pve_guest_config_text() {
   else                          timeout 20 pct config "$id" 2>/dev/null; fi
 }
 
+# "qm config" zeigt ohne --current die anstehenden Änderungen, also den Stand
+# nach dem nächsten Start der VM. Für einen laufenden Gast zählt aber, was jetzt
+# gilt: wer freeze-fs gerade erst umgestellt und die VM noch nicht neu gestartet
+# hat, bekäme sonst ein "bereit", obwohl die laufende VM weiterhin sagt, dass
+# ihre Dateisysteme nicht angehalten werden dürfen.
+pve_qemu_config_current() {
+  local id="$1"
+  [[ "$id" =~ ^[0-9]+$ ]] || return 1
+  timeout 20 qm config "$id" --current 2>/dev/null
+}
+
 # Gibt "key|volid|extra" je Datenträger-Eintrag aus (CD-ROMs übersprungen).
 pve_parse_volume_lines() {
   local t="$1" cfg="$2" line key val volid extra
@@ -1606,19 +1617,25 @@ pb_qemu_agent_enabled() {
   return 1
 }
 
-# Proxmox kennt zusätzlich "freeze-fs-on-backup=0" (auch als "freeze-fs=0"
-# geschrieben). Damit hat der Betreiber das Anhalten der Dateisysteme für diese
-# VM bewusst abgeschaltet - meist, weil der Gast das nicht verträgt. Panzerbackup
-# darf sich darüber nicht stillschweigend hinwegsetzen.
+# Seit Proxmox 9 heißt die Option "freeze-fs"; "freeze-fs-on-backup" und
+# "guest-fsfreeze" sind Aliase derselben Einstellung und alle drei kommen in
+# Konfigurationen vor. Steht sie auf 0, hat der Betreiber das Anhalten der
+# Dateisysteme für diese VM bewusst abgeschaltet - meist, weil der Gast das nicht
+# verträgt. Panzerbackup darf sich darüber nicht stillschweigend hinwegsetzen.
+# PB_FSFREEZE_KEY hält die gefundene Schreibweise fest, damit Befund und Hinweis
+# die Konfiguration zitieren statt zu raten.
+PB_FSFREEZE_KEY=""
 pb_qemu_fsfreeze_disabled() {
   local val part
+  PB_FSFREEZE_KEY=""
   val="$(grep -m1 -E '^agent:' <<< "${1:-}" || true)"
   [[ -n "$val" ]] || return 1
   val="${val#agent:}"; val="${val# }"
   while IFS= read -r part; do
     part="${part// /}"
     case "$part" in
-      freeze-fs=0|freeze-fs-on-backup=0) return 0 ;;
+      freeze-fs=0|freeze-fs-on-backup=0|guest-fsfreeze=0)
+        PB_FSFREEZE_KEY="${part%%=*}"; return 0 ;;
     esac
   done < <(printf '%s\n' "${val//,/$'\n'}")
   return 1
@@ -1637,7 +1654,8 @@ pve_qga_probe() {
 }
 
 pve_dr_check_guests() {
-  local g t id st line key volid extra cls status reason detail cfg
+  local g t id st line key volid extra cls status reason detail cfg cfgcur
+  local fs_now fs_next fs_key pend_de pend_en fix_de fix_en
   local vg lv row size alloc lvtype qga volcount pools_used=()
 
   PB_VOLUMES=(); PB_GUEST_REPORT=()
@@ -1672,20 +1690,39 @@ pve_dr_check_guests() {
 
     if [[ "$st" == "running" && "$t" == "qemu" ]]; then
       qga="$(pve_qga_probe "$id" "$cfg")"
-      if [[ "$qga" == "ok" ]] && pb_qemu_fsfreeze_disabled "$cfg"; then
+      cfgcur="$(pve_qemu_config_current "$id")"; [[ -n "$cfgcur" ]] || cfgcur="$cfg"
+      # Abgelehnt wird, sobald eine der beiden Fassungen das Anhalten verbietet:
+      # die laufende, weil sie jetzt gilt, und die anstehende, weil sie die
+      # neueste Ansage des Betreibers ist.
+      fs_now=0; fs_next=0; fs_key=""; pend_de=""; pend_en=""
+      if pb_qemu_fsfreeze_disabled "$cfgcur"; then fs_now=1;  fs_key="$PB_FSFREEZE_KEY"; fi
+      if pb_qemu_fsfreeze_disabled "$cfg";    then fs_next=1; [[ -n "$fs_key" ]] || fs_key="$PB_FSFREEZE_KEY"; fi
+      PB_FSFREEZE_KEY="$fs_key"
+      if (( fs_now == 1 && fs_next == 0 )); then
+        # Der Betreiber hat es schon wieder erlaubt - dann ist "erlaube es wieder"
+        # der falsche Rat. Fehlt nur noch, dass die VM die Änderung übernimmt.
+        pend_de=" In der Konfiguration ist das Anhalten bereits wieder erlaubt, die laufende VM übernimmt das aber erst nach einem Stopp und Start - ein Neustart im Gast genügt dafür nicht."
+        pend_en=" The configuration already allows pausing again, but the running VM only picks that up after a stop and a start - a reboot inside the guest is not enough."
+        fix_de="Die VM einmal stoppen und starten, damit die bereits geänderte Konfiguration wirksam wird - 'qm reboot ${id}' erledigt beides in einem Schritt. Ein Neustart im Gast reicht nicht, weil Proxmox anstehende Änderungen nur beim Start der VM übernimmt."
+        fix_en="Stop and start the VM once so the configuration change that has already been made takes effect - 'qm reboot ${id}' does both in one step. A reboot inside the guest is not enough, because Proxmox applies pending changes only when the VM starts."
+      else
+        fix_de="Entweder das Anhalten wieder erlauben - in der Oberfläche unter Optionen -> QEMU Guest Agent, auf der Kommandozeile ${PB_FSFREEZE_KEY}=0 aus der Zeile 'agent:' entfernen oder auf 1 setzen (Standard ist 1) -, oder die VM für die Sicherung stoppen. Wurde sie bewusst abgeschaltet, weil der Gast das Anhalten nicht verträgt, ist diese VM für das Disaster-Recovery-Verfahren nicht geeignet."
+        fix_en="Either allow the pause again - in the GUI under Options -> QEMU Guest Agent, on the command line remove ${PB_FSFREEZE_KEY}=0 from the 'agent:' line or set it to 1 (the default is 1) -, or stop the VM for the backup. If it was disabled deliberately because the guest cannot tolerate the pause, this VM is not suitable for the disaster recovery procedure."
+      fi
+      if [[ "$qga" == "ok" ]] && (( fs_now || fs_next )); then
         # Mit ausdrücklich erlaubtem Herunterfahren ist dieser Gast kein
         # Abbruchgrund: der Lauf stoppt ihn für die Momentaufnahme kontrolliert
         # und startet ihn danach wieder (siehe pve_dr_snapshot_one_guest).
         if [[ "${PVE_DR_ALLOW_SHUTDOWN:-0}" == "1" ]]; then
           qga="freeze-aus/stop"
           pb_warn "$(L "VM ${id} wird für die Sicherung heruntergefahren" "VM ${id} will be shut down for the backup")" \
-                  "$(L "Für diese VM ist das Anhalten der Dateisysteme abgeschaltet (Option freeze-fs-on-backup=0). Da das Herunterfahren von Gästen ausdrücklich erlaubt wurde (PVE_DR_ALLOW_SHUTDOWN=1), fährt der Lauf diese VM kontrolliert herunter, legt die Momentaufnahme an und startet sie danach wieder. Für die Dauer dieses Vorgangs ist sie nicht verfügbar." "For this VM, pausing the filesystems is disabled (option freeze-fs-on-backup=0). Since shutting down guests was explicitly permitted (PVE_DR_ALLOW_SHUTDOWN=1), the run shuts this VM down in a controlled way, takes the snapshot and starts it again afterwards. It is unavailable for the duration of that step.")"
+                  "$(L "Für diese VM ist das Anhalten der Dateisysteme abgeschaltet (Option ${PB_FSFREEZE_KEY}=0). Da das Herunterfahren von Gästen ausdrücklich erlaubt wurde (PVE_DR_ALLOW_SHUTDOWN=1), fährt der Lauf diese VM kontrolliert herunter, legt die Momentaufnahme an und startet sie danach wieder. Für die Dauer dieses Vorgangs ist sie nicht verfügbar." "For this VM, pausing the filesystems is disabled (option ${PB_FSFREEZE_KEY}=0). Since shutting down guests was explicitly permitted (PVE_DR_ALLOW_SHUTDOWN=1), the run shuts this VM down in a controlled way, takes the snapshot and starts it again afterwards. It is unavailable for the duration of that step.")"
         else
           qga="freeze-aus"
           pb_fail "$(L "VM ${id} kann nicht konsistent gesichert werden" "VM ${id} cannot be backed up consistently")" \
-                  "$(L "Für diese VM ist das Anhalten der Dateisysteme ausdrücklich abgeschaltet (Option freeze-fs-on-backup=0). Der Gastagent ist zwar erreichbar, darf die Dateisysteme aber nicht kurz anhalten - die Sicherung wäre nur so konsistent wie nach einem Stromausfall." "For this VM, pausing the filesystems is explicitly disabled (option freeze-fs-on-backup=0). The guest agent is reachable but must not pause the filesystems - the backup would only be as consistent as after a power cut.")" \
-                  "$(L "Entweder die Option in der VM-Konfiguration wieder aktivieren (Optionen -> QEMU Guest Agent -> Freeze-FS-on-Backup), oder die VM für die Sicherung stoppen. Wurde sie bewusst abgeschaltet, weil der Gast das Anhalten nicht verträgt, ist diese VM für das Disaster-Recovery-Verfahren nicht geeignet." "Either re-enable the option in the VM configuration (Options -> QEMU Guest Agent -> Freeze-FS-on-Backup), or stop the VM for the backup. If it was disabled deliberately because the guest cannot tolerate the pause, this VM is not suitable for the disaster recovery procedure.")" \
-                  "vmid=${id} agent has freeze-fs-on-backup=0"
+                  "$(L "Für diese VM ist das Anhalten der Dateisysteme ausdrücklich abgeschaltet (Option ${PB_FSFREEZE_KEY}=0). Der Gastagent ist zwar erreichbar, darf die Dateisysteme aber nicht kurz anhalten - die Sicherung wäre nur so konsistent wie nach einem Stromausfall.${pend_de}" "For this VM, pausing the filesystems is explicitly disabled (option ${PB_FSFREEZE_KEY}=0). The guest agent is reachable but must not pause the filesystems - the backup would only be as consistent as after a power cut.${pend_en}")" \
+                  "$(L "$fix_de" "$fix_en")" \
+                  "vmid=${id} agent has ${PB_FSFREEZE_KEY}=0"
         fi
       fi
       case "$qga" in
@@ -3301,14 +3338,19 @@ pve_dr_snapshot_one_guest() {
   fi
 
   if [[ "$t" == "qemu" ]]; then
-    local cfg; cfg="$(pve_guest_config_text qemu "$id" || true)"
-    if pb_qemu_fsfreeze_disabled "$cfg"; then
+    # Der Gast läuft an dieser Stelle. Verboten ist das Anhalten, sobald es die
+    # laufende oder die anstehende Konfiguration verbietet.
+    local cfg cfgp
+    cfgp="$(pve_guest_config_text qemu "$id" || true)"
+    cfg="$(pve_qemu_config_current "$id" || true)"
+    [[ -n "$cfg" ]] || cfg="$cfgp"
+    if pb_qemu_fsfreeze_disabled "$cfg" || pb_qemu_fsfreeze_disabled "$cfgp"; then
       # Kein stiller Ersatz durch suspend: entweder der Benutzer hat einem
       # kontrollierten Herunterfahren ausdrücklich zugestimmt, oder der Lauf
       # scheitert. Ein "suspend" hält nur die CPU an, nicht die Dateisysteme.
       if [[ "${PVE_DR_ALLOW_SHUTDOWN:-0}" != "1" ]]; then
-        pve_dr_fail "VM ${id} darf nicht angehalten werden (freeze-fs-on-backup=0) und ein Herunterfahren wurde nicht erlaubt." \
-                    "VM ${id} must not be paused (freeze-fs-on-backup=0) and shutdown was not permitted."
+        pve_dr_fail "VM ${id} darf nicht angehalten werden (${PB_FSFREEZE_KEY}=0) und ein Herunterfahren wurde nicht erlaubt." \
+                    "VM ${id} must not be paused (${PB_FSFREEZE_KEY}=0) and shutdown was not permitted."
         return 1
       fi
       pbdr_log "VM ${id}: fahre kontrolliert herunter (ausdrücklich erlaubt)" \
@@ -4236,7 +4278,7 @@ do_backup_background() {
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="3.0.1"
+VERSION="3.0.2"
 set -E
 trap 'rc=$?; if [[ "${LANG_CHOICE:-de}" == "de" ]]; then set_status "FEHLER: Backup abgebrochen (RC=$rc)"; else set_status "ERROR: Backup aborted (RC=$rc)"; fi; echo "ERROR (Backup Worker) line $LINENO: $BASH_COMMAND (RC=$rc)"; exit $rc' ERR
 
@@ -4389,6 +4431,29 @@ disarm_quiesce_watchdog() {
   rm -f "$QUIESCE_WATCHDOG_PID_FILE"
 }
 
+# Wie pb_qemu_fsfreeze_disabled im Hauptskript, nur eigenständig: der Worker
+# ist ein separates Skript und liest die Konfiguration selbst. "freeze-fs=0"
+# (Aliase "freeze-fs-on-backup", "guest-fsfreeze") ist die ausdrückliche Ansage
+# des Betreibers, diesen Gast nicht einzufrieren - auch --quiesce darf sich
+# darüber nicht hinwegsetzen.
+qm_fsfreeze_disabled() {
+  local vmid="${1:?}" val part
+  # --current ist der laufende Stand, ohne --current der anstehende. Verboten
+  # ist das Anhalten, sobald eine der beiden Fassungen es verbietet.
+  for val in "$(timeout 20 qm config "$vmid" --current 2>/dev/null | grep -m1 -E '^agent:' || true)" \
+             "$(timeout 20 qm config "$vmid" 2>/dev/null | grep -m1 -E '^agent:' || true)"; do
+    [[ -n "$val" ]] || continue
+    val="${val#agent:}"; val="${val# }"
+    while IFS= read -r part; do
+      part="${part// /}"
+      case "$part" in
+        freeze-fs=0|freeze-fs-on-backup=0|guest-fsfreeze=0) return 0 ;;
+      esac
+    done < <(printf '%s\n' "${val//,/$'\n'}")
+  done
+  return 1
+}
+
 pve_quiesce_start() {
   FROZEN_QM=(); SUSPENDED_QM=(); RUN_CT=(); RUN_QM=()
 
@@ -4414,6 +4479,11 @@ pve_quiesce_start() {
     mapfile -t RUN_QM < <(qm list 2>/dev/null | awk 'NR>1 && $3=="running"{print $1}')
     for vm in "${RUN_QM[@]:-}"; do
       [[ -n "$vm" ]] || continue
+      if qm_fsfreeze_disabled "$vm"; then
+        msg "  - VM $vm: Anhalten in der VM-Konfiguration abgeschaltet → bleibt unberührt (crash-konsistent)" \
+            "  - VM $vm: pausing disabled in the VM configuration → left untouched (crash-consistent)"
+        continue
+      fi
       if qm agent "$vm" ping >/dev/null 2>&1; then
         msg "  - VM $vm: QGA ok → fsfreeze-freeze" "  - VM $vm: QGA ok → fsfreeze-freeze"
         if qm agent "$vm" fsfreeze-freeze >/dev/null 2>&1; then

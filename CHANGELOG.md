@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented here.
 
+## v3.0.2 - 2026-09-04
+
+Everything in this release is about one promise: a guest whose configuration forbids freezing is never frozen. Three ways around that promise are closed.
+
+- **`--quiesce` in RAW mode now honours the setting the PVE-DR preflight refuses over.** The RAW freeze loop walked `qm list`, pinged the agent and froze every running VM without ever reading a guest configuration. A VM whose configuration says "do not freeze me" was therefore frozen anyway by `--quiesce`, while PVE-DR refuses to touch it — the two modes contradicted each other on the same host. Such guests are now skipped, and the skip is reported in the log; everything else about the run is unchanged.
+- **The third spelling of the setting is recognised.** Since Proxmox 9 the canonical name is `freeze-fs`; `freeze-fs-on-backup` and `guest-fsfreeze` are aliases for it. Only the first two were matched, so a guest configured with `guest-fsfreeze=0` was silently frozen against the operator's wishes.
+- **A pending configuration change no longer counts as one that already applies.** `qm config` shows pending values — the state after the next start of the VM — while the running guest still obeys the old ones. Panzerbackup read only that pending view, so a `freeze-fs=1` set five minutes ago on a running VM read as permission to freeze, although the VM itself was still configured not to be. For a running guest both views are now read, and the freeze is refused as soon as either one forbids it: the running configuration because it is what applies now, the pending one because it is the operator's latest word. When the two differ in the harmless direction — already re-enabled, not yet active — the finding says so, and its suggested fix changes accordingly: not "re-enable the setting", which the operator has just done, but the one step still missing, `qm reboot <vmid>`, with the note that a reboot inside the guest does not apply pending changes.
+- **Findings quote the configuration instead of guessing.** Reason, fix and technical detail now name the spelling actually found in the `agent:` line, and the suggested fix no longer points at a GUI label that Proxmox 9 no longer uses.
+
+Tests: the backup worker lives in a heredoc, so `bash -n` on the main script never covered it — it is now syntax-checked separately, and the RAW-mode skip, all three spellings and both directions of a pending change are covered by their own checks.
+
 ## v3.0.1 - 2026-09-04
 
 A patch release for one promise version 3.0.0 made but could not keep.
